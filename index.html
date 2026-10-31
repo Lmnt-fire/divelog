@@ -1231,7 +1231,7 @@ async function save(...colls) { for (const c of (colls.length ? colls : COLLS)) 
 async function load() {
   await DB.open();
   const first = await DB.get('dives');
-  if (first && first.length) { for (const c of COLLS) S[c] = (await DB.get(c)) ?? S[c]; migrateGear(); }
+  if (first && first.length) { for (const c of COLLS) S[c] = (await DB.get(c)) ?? S[c]; migrateGear(); repairData(); }
   else seed();
   try { if (navigator.storage?.persist) S.meta.persisted = await navigator.storage.persist(); } catch (e) { }
 }
@@ -1240,8 +1240,8 @@ function seed() {
   for (const c of COLLS) if (D[c]) S[c] = D[c];
   S.meta = { seededAt: new Date().toISOString(), lastBackup: null };
   // fingerprint imported signatures so later edits are detectable
-  for (const sg of S.signatures) { sg.fp = {}; for (const id of sg.diveIds) { const d = diveById(id); if (d) sg.fp[id] = fingerprint(d); } }
-  save();
+  for (const sg of S.signatures) if (!sg.fp || !Object.keys(sg.fp).length) { sg.fp = {}; for (const id of sg.diveIds) { const d = diveById(id); if (d) sg.fp[id] = fingerprint(d); } }
+  repairData(); save();
 }
 
 /* ================= model helpers ================= */
@@ -1252,7 +1252,13 @@ const fingerprint = d => [d.start, d.siteId, d.maxDepth, d.duration].join('|');
 const chrono = () => [...S.dives].sort((a, b) => a.start.localeCompare(b.start));
 const sigsFor = d => S.signatures.filter(s => s.diveIds.includes(d.id));
 const isSigned = d => sigsFor(d).length > 0;
-const sigChanged = (sg, d) => sg.fp && sg.fp[d.id] && sg.fp[d.id] !== fingerprint(d) && sg.fp[d.id] !== fingerprint(d) + '|' + d.num;
+function sigChanged(sg, d) {
+  const fp = sg.fp && sg.fp[d.id]; if (!fp) return false;
+  const [start, site, depth, dur] = fp.split('|');
+  const sameSite = site === String(d.siteId) || (siteById(d.siteId)?.aliases || []).includes(site);
+  return !(start === String(d.start) && sameSite && depth === String(d.maxDepth) && dur === String(d.duration));
+}
+const uidTime = id => { const t = parseInt(String(id).slice(1, 9), 36); return t > 1.5e12 && t < 4e12 ? t : null; };
 function sac(d) {
   const t = d.tank || {}; const depth = d.avgDepth;
   if (!t.start || !t.end || !t.volume || !d.duration || !depth) return null;
@@ -1296,6 +1302,44 @@ function serviceDue(g) {
 function gearLine(e) {
   if (e.src === 'own') { const g = S.gear.find(x => x.id === e.itemId); return `${catName(e.cat)}: ${g ? esc(itemName(g)) : 'own'}${g?.size ? ' · ' + esc(g.size) : ''} <span class="muted">(own)</span>`; }
   return `${catName(e.cat)}${e.model ? ': ' + esc(e.model) : ''}${e.size ? ' · size ' + esc(e.size) : ''} <span class="muted">(rented)</span>`;
+}
+function repairData() {
+  const notes = []; S.meta = S.meta || {}; S.meta.fixes = S.meta.fixes || [];
+  // a) site renamed through the search box before v4 created a new site and voided signatures: re-link to the signed site
+  for (const sg of S.signatures) for (const id of Object.keys(sg.fp || {})) {
+    const d = diveById(id); if (!d) continue;
+    const [start, X, depth, dur] = sg.fp[id].split('|'); const Y = d.siteId;
+    if (X === String(Y) || start !== String(d.start) || depth !== String(d.maxDepth) || dur !== String(d.duration)) continue;
+    const sx = siteById(X), sy = siteById(Y); if (!sx || !sy) continue;
+    const t = uidTime(Y); if (!t || t < Date.parse(sg.signedAt)) continue;          // Y created after signing
+    // every dive on Y must be a signed dive whose fingerprint points to X (a pure rename), otherwise leave it flagged
+    if (S.dives.some(o => o.siteId === Y && !S.signatures.some(g => (g.fp?.[o.id] || '').split('|')[1] === X))) continue;
+    sx.name = sy.name; if (sy.lat != null && (sx.lat == null || sy.gpsVerified)) Object.assign(sx, { lat: sy.lat, lon: sy.lon, gpsSource: sy.gpsSource, gpsVerified: sy.gpsVerified });
+    sx.country = sx.country || sy.country; sx.region = sx.region || sy.region;
+    const moved = S.dives.filter(o => o.siteId === Y); moved.forEach(o => o.siteId = X); S.sites = S.sites.filter(z => z.id !== Y);
+    notes.push(`Dive${moved.length > 1 ? 's' : ''} ${moved.map(o => '#' + o.num).join(', ')}: site rename re-linked to the signed site “${sx.name}”; signature valid again.`);
+  }
+  // b) 31 Oct 2026 review: Sha'ab Maksur points were on land; identical points shared by different sites
+  if (!S.meta.fixes.includes('sites-2026-10-31')) {
+    for (const st of S.sites) if (/^sh?a.?b maksou?r/i.test(st.name) && st.lat != null && Math.abs(st.lon - 35.428) < .01 && Math.abs(st.lat - 24.21) < .01) {
+      const old = `${st.lat}, ${st.lon}`;
+      Object.assign(st, { lat: 24.2408, lon: 35.6516, gpsVerified: false, gpsSource: `Wikibubbles (reef, approximate). Previous point ${old} was on land` });
+      notes.push(`${st.name}: position moved from land (${old}) to the reef (24.2408, 35.6516), to check.`);
+    }
+    const groups = {}; for (const st of S.sites) if (st.lat != null) (groups[st.lat.toFixed(4) + ',' + st.lon.toFixed(4)] = groups[st.lat.toFixed(4) + ',' + st.lon.toFixed(4)] || []).push(st);
+    for (const g of Object.values(groups)) if (g.length > 1) for (const st of g) if (st.gpsVerified) { st.gpsVerified = false; st.gpsSource = `${st.gpsSource} · same point as ${g.filter(o => o !== st).map(o => o.name).join(', ')}`; }
+    S.meta.fixes.push('sites-2026-10-31');
+  }
+  if (notes.length) { S.meta.repairLog = [...(S.meta.repairLog || []), ...notes.map(t => ({ at: new Date().toISOString().slice(0, 10), t }))]; save('sites', 'dives', 'meta'); setTimeout(() => toast(notes[0] + (notes.length > 1 ? ` (+${notes.length - 1} more, see Backup & settings)` : '')), 600); }
+  else if (S.meta.fixes.length) save('sites', 'meta');
+}
+function mergeSites(fromId, intoId) {
+  const a = siteById(fromId), b = siteById(intoId); if (!a || !b || a === b) return;
+  S.dives.forEach(d => { if (d.siteId === fromId) d.siteId = intoId; });
+  b.aliases = [...new Set([...(b.aliases || []), fromId, ...(a.aliases || [])])];
+  if (b.lat == null && a.lat != null) Object.assign(b, { lat: a.lat, lon: a.lon, gpsSource: a.gpsSource, gpsVerified: a.gpsVerified });
+  b.notes = [b.notes, `Merged “${a.name}” on ${new Date().toISOString().slice(0, 10)}`].filter(Boolean).join('\n');
+  S.sites = S.sites.filter(z => z.id !== fromId);
 }
 function migrateGear() { // v1 stored gear as id strings
   let changed = false;
@@ -1759,7 +1803,7 @@ const siteOnline = debounce(async (q, seq) => {
 function siteTyping(q) {
   siteSeq++;
   if (Dmeta.site && norm(Dmeta.site.name) !== norm(q)) { // typing a different name: detach from the chosen site
-    if (Dmeta.site.id && siteById(Dmeta.site.id)) { Dmeta.site = null; D.siteId = null; } else Dmeta.site.name = q;
+    if (Dmeta.site.id && siteById(Dmeta.site.id)) { Dmeta.prevSite = Dmeta.site; Dmeta.site = null; D.siteId = null; } else Dmeta.site.name = q;
     drawSiteCard();
   }
   if (q.trim().length < 2) { $('#siteSugg').innerHTML = ''; return; }
@@ -1810,12 +1854,19 @@ function drawSiteCard() {
   const el = $('#siteCard'); if (!el) return; const s = Dmeta.site;
   if (!s) { el.innerHTML = ''; return; }
   const has = s.lat != null;
-  el.innerHTML = `<div class="sitecard">${icon('pin')}<div class="grow stack" style="gap:4px"><div><b>${esc(s.name)}</b> ${siteById(s.id) ? '<span class="badge">In your log</span>' : '<span class="badge accent">New site</span>'}</div>
+  const nDives = S.dives.filter(d => d.siteId === s.id && d.id !== D.id).length + 1;
+  const prev = Dmeta.prevSite && !siteById(s.id) && Dmeta.prevSite.id !== s.id ? Dmeta.prevSite : null;
+  const near = S.sites.filter(o => o.id !== s.id && siteById(s.id)).map(o => ({ o, km: kmBetween(s, o) })).filter(x => x.km == null ? (s.region && x.o.region === s.region) : x.km < 30).sort((a, b) => (a.km ?? 99) - (b.km ?? 99)).slice(0, 12);
+  el.innerHTML = `${prev ? `<div class="notice warn">${icon('warn')}<div class="small grow">Did you mean to <b>rename</b> “${esc(prev.name)}”? A new site detaches this dive${isSignedDraft() ? ' and voids its signature' : ''}.
+      <div style="margin-top:6px"><button type="button" class="btn small" data-act="rename-instead">Rename “${esc(prev.name)}” to “${esc(s.name)}”</button></div></div></div>` : ''}
+    <div class="sitecard">${icon('pin')}<div class="grow stack" style="gap:4px"><div><b>${esc(s.name)}</b> ${siteById(s.id) ? '<span class="badge">In your log</span>' : '<span class="badge accent">New site</span>'}</div>
+      ${siteById(s.id) ? `<label class="f">Site name <span class="u">renames it for ${nDives} dive${nDives > 1 ? 's' : ''}; signatures stay valid</span><input type="text" id="siteRename" value="${esc(s.name)}"></label>` : ''}
       ${has ? `<div class="num small">${(+s.lat).toFixed(5)}, ${(+s.lon).toFixed(5)}</div><div class="small muted">Source: ${esc(s.gpsSource || 'manual')}${s.gpsVerified ? '' : ' · not verified'}</div>` : '<div class="small" style="color:var(--warn)">No GPS position yet.</div>'}
       <div class="grid2"><label class="f">Country<input type="text" id="siteCountry" value="${esc(s.country)}"></label><label class="f">Region<input type="text" id="siteRegion" value="${esc(s.region)}"></label></div>
       ${siteHistory(s.id)}
       ${s.url ? `<a class="small" href="${esc(s.url)}" target="_blank" rel="noopener">Read about this site on Wikipedia</a>` : ''}
       ${has && !s.gpsVerified ? `<button type="button" class="btn small" data-act="verify-gps">${icon('check')}Position is correct</button>` : ''}
+      ${near.length ? `<details class="small"><summary>Same place as another site? Merge</summary><div class="row" style="margin-top:6px"><select id="mergeSel" aria-label="Merge into">${near.map(x => `<option value="${x.o.id}">${esc(x.o.name)}${x.km != null ? ` · ${fmt(x.km, 1)} km` : ''}</option>`).join('')}</select><button type="button" class="btn small" data-act="merge-ask">Merge</button></div><div id="mergeZone"></div></details>` : ''}
     </div></div>
     <div class="fallback panel"><h3>${has ? 'Change position' : 'Find the GPS position'}</h3>
       <div class="row wrap"><button type="button" class="btn small water" data-act="gps-now">${icon('gps')}Use my position now</button><button type="button" class="btn small" data-act="pick-map">${icon('pin')}Pick on map</button></div>
@@ -1826,8 +1877,10 @@ function drawSiteCard() {
         <li><a target="_blank" rel="noopener" href="https://www.google.com/search?q=${encodeURIComponent(s.name + ' dive site site:padi.com OR site:divessi.com OR site:wannadive.net')}">Search PADI, SSI and Wannadive pages</a>; many list coordinates or a map.</li></ol>`}
     </div>`;
   $('#siteCountry').addEventListener('input', e => s.country = e.target.value);
+  const rn = $('#siteRename'); if (rn) rn.addEventListener('input', e => { s.name = e.target.value; $('#siteName').value = s.name; });
   $('#siteRegion').addEventListener('input', e => s.region = e.target.value);
 }
+function isSignedDraft() { return !!(D?.signatureIds || []).length; }
 function setSiteCoords(lat, lon, src, verified) {
   const s = Dmeta.site; if (!s) return;
   Object.assign(s, { lat, lon, gpsSource: src, gpsVerified: verified });
@@ -2356,6 +2409,7 @@ function openMore() {
         <div class="grid2"><label class="f">Last service<input type="date" data-gf="lastService" data-id="${g.id}" value="${esc(g.lastService)}"></label><label class="f">Service every <span class="u">months</span><input type="number" data-gf="serviceMonths" data-id="${g.id}" value="${g.serviceMonths ?? ''}" inputmode="numeric"></label></div>
         <button type="button" class="btn small" data-act="gear-item-del" data-id="${g.id}">${g.retired ? 'Back in use' : 'Sold / retired'}</button></div>`; }).join('')}
       <button class="btn small" data-act="gear-item-add">${icon('plus')}Add an item I own</button></div>
+    ${(S.meta.repairLog || []).length ? `<div class="panel stack"><h3>Automatic corrections</h3>${S.meta.repairLog.map(r => `<div class="small"><span class="num muted">${r.at}</span> ${esc(r.t)}</div>`).join('')}</div>` : ''}
     <div class="panel stack"><h3>About this data</h3><div class="small">${S.dives.length} dives, ${S.sites.length} sites, ${S.signatures.length} signature records, ${S.certs.length} cards. Storage: ${DB.mem ? 'temporary (this browser blocks storage)' : S.meta.persisted ? 'persistent on this device' : 'browser storage (may be cleared if the phone runs low on space)'}.</div>
       <div id="resetZone"><button class="btn small danger" data-act="ask-reset">Reset to original imported log</button></div></div>`);
   $('#impJson').addEventListener('change', importJSON);
@@ -2394,7 +2448,7 @@ async function applyImport(mode) {
   if (mode === 'replace') { COLLS.forEach(c => { if (data[c]) S[c] = data[c]; }); }
   else { for (const c of ['dives', 'sites', 'gear', 'signers', 'signatures', 'certs']) for (const x of (data[c] || [])) if (!S[c].some(y => y.id === x.id)) S[c].push(x); }
   for (const sg of S.signatures) if (!sg.fp) { sg.fp = {}; for (const id of sg.diveIds) { const d = diveById(id); if (d) sg.fp[id] = fingerprint(d); } }
-  migrateGear(); await save(); closeSheet(); toast('Backup restored'); route();
+  migrateGear(); repairData(); await save(); closeSheet(); toast('Backup restored'); route();
 }
 function printLogbook() {
   const host = $('#print'); host.innerHTML = chrono().map(d => { const s = siteById(d.siteId) || {}; const sig = sigsFor(d)[0]; const sg = sig?.signerId ? signerById(sig.signerId) : null;
@@ -2430,6 +2484,12 @@ document.addEventListener('click', async e => {
     case 'pick-map': openMapPicker(); break;
     case 'verify-gps': Dmeta.site.gpsVerified = true; drawSiteCard(); break;
     case 'import': openImport(); break;
+    case 'rename-instead': { const nm = Dmeta.site.name; const coords = Dmeta.site.lat != null ? { lat: Dmeta.site.lat, lon: Dmeta.site.lon, gpsSource: Dmeta.site.gpsSource, gpsVerified: Dmeta.site.gpsVerified } : {};
+      Dmeta.site = { ...Dmeta.prevSite, name: nm, ...coords }; D.siteId = Dmeta.site.id; Dmeta.prevSite = null; $('#siteName').value = nm; drawSiteCard(); drawSun(); break; }
+    case 'merge-ask': { const t = siteById($('#mergeSel').value); const n2 = S.dives.filter(d => d.siteId === Dmeta.site.id).length;
+      $('#mergeZone').innerHTML = `<div class="confirm" style="margin-top:6px"><span class="grow small">Move ${n2} dive${n2 > 1 ? 's' : ''} of “${esc(Dmeta.site.name)}” into “${esc(t.name)}” and delete “${esc(Dmeta.site.name)}”? Signatures stay valid.</span><button type="button" class="btn small" data-act="merge-do" data-id="${t.id}">Merge</button></div>`; break; }
+    case 'merge-do': { const from = Dmeta.site.id; const i = S.sites.findIndex(x => x.id === from); if (i >= 0) S.sites[i] = Dmeta.site; mergeSites(from, id);
+      Dmeta.site = clone(siteById(id)); D.siteId = id; $('#siteName').value = Dmeta.site.name; await save('sites', 'dives'); drawSiteCard(); drawSun(); toast('Sites merged'); break; }
     case 'renumber': renumber(); break;
     case 'gear-src': setGearSrc(b.dataset.cat, b.dataset.v); break;
     case 'gear-own-add': { const cat = b.dataset.cat; const nm = $(`[data-gnew="${cat}"]`).value.trim(); if (!nm) { toast('Add brand and model'); break; }
