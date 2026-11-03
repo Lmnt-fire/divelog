@@ -1414,48 +1414,114 @@ async function fetchJSON(url, opt = {}, ms = 8000) {
   try { const r = await fetch(url, { ...opt, signal: c.signal }); if (!r.ok) throw new Error(r.status); return await r.json(); }
   finally { clearTimeout(t); }
 }
+/* ================= dive-site search: fuzzy, local-first, area-bound ================= */
+// Spelling tolerance: transliteration variants (Arabic, Indonesian, Spanish), generic words removed, doubled letters collapsed.
+const GENERIC = new Set(['reef', 'reefs', 'riff', 'recif', 'arrecife', 'karang', 'terumbu', 'dive', 'site', 'spot', 'point', 'the', 'el', 'al', 'il', 'la', 'le', 'de', 'del', 'di', 'of', 'north', 'south', 'east', 'west', 'nord', 'sud', 'island', 'isla', 'ile', 'pulau', 'gili', 'wreck', 'house']);
+const DIRS = { north: 'n', south: 's', east: 'e', west: 'w', nord: 'n', sud: 's', utara: 'n', selatan: 's' };
+function fkey(s) {
+  const words = norm(s).replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w && !GENERIC.has(w));
+  return words.map(w => w.replace(/^sh?a+a?b$|^sheb$/, 'shab').replace(/ph/g, 'f').replace(/ae/g, 'e').replace(/ou/g, 'u').replace(/oo/g, 'u')
+    .replace(/kh/g, 'k').replace(/q/g, 'k').replace(/c(?!h)/g, 'k').replace(/z/g, 's').replace(/y/g, 'i').replace(/(.)\1+/g, '$1').replace(/(.)h$/, '$1')).filter(Boolean);
+}
+function trig(s) { const p = ` ${s} `; const out = new Set(); for (let i = 0; i < p.length - 2; i++) out.add(p.slice(i, i + 3)); return out; }
+function dice(a, b) { if (!a.size || !b.size) return 0; let n = 0; for (const x of a) if (b.has(x)) n++; return 2 * n / (a.size + b.size); }
+function fuzzyScore(q, name) {
+  const qa = fkey(q), na = fkey(name); if (!qa.length || !na.length) return 0;
+  const qs = qa.join(''), ns = na.join('');
+  if (ns === qs) return 1;
+  let s = dice(trig(qs), trig(ns));
+  // every query word should resemble some name word (handles extra words like "reef" variants and order)
+  const per = qa.map(w => Math.max(...na.map(v => v.startsWith(w) || w.startsWith(v) ? 1 : dice(trig(w), trig(v)))));
+  s = Math.max(s, per.reduce((a, b) => a + b, 0) / per.length * .95);
+  // direction words (north/south) are a tie-breaker, not a filter
+  const qd = norm(q).split(/\s+/).map(w => DIRS[w]).filter(Boolean), nd = norm(name).split(/\s+/).map(w => DIRS[w]).filter(Boolean);
+  if (qd.length && nd.length) s += qd.some(x => nd.includes(x)) ? .05 : -.05;
+  return s;
+}
+
+// Search centre: phone GPS (cached 30 min) or last logged dive with a position.
+const Centre = {
+  fix: null,
+  load() { try { const f = JSON.parse(localStorage.getItem('lastFix') || 'null'); if (f && Date.now() - f.t < 30 * 6e4) this.fix = f; } catch (e) { } },
+  ask() {
+    return new Promise(res => {
+      if (!navigator.geolocation) return res(null);
+      navigator.geolocation.getCurrentPosition(p => { this.fix = { lat: p.coords.latitude, lon: p.coords.longitude, t: Date.now() }; try { localStorage.setItem('lastFix', JSON.stringify(this.fix)); } catch (e) { } res(this.fix); },
+        () => res(null), { enableHighAccuracy: false, timeout: 8000, maximumAge: 30 * 6e4 });
+    });
+  },
+  get() {
+    if (this.fix && Date.now() - this.fix.t < 30 * 6e4) return { lat: this.fix.lat, lon: this.fix.lon, label: 'your position' };
+    const last = chrono().filter(d => siteById(d.siteId)?.lat != null).pop();
+    if (last) { const s = siteById(last.siteId); return { lat: s.lat, lon: s.lon, label: `your last dive (${s.name})` }; }
+    return null;
+  }
+};
+
+// Offline pack: every mapped dive site, reef and named wreck within RADIUS km, from OpenStreetMap.
+const RADIUS = 150;
+const Pack = {
+  data: null, busy: null,
+  async load() { this.data = (await DB.get('sitepack')) || null; },
+  covers(c) { return this.data && c && kmBetween(this.data.centre, c) <= RADIUS * .4 && Date.now() - this.data.at < 30 * 864e5; },
+  async ensure(c, force) {
+    if (!c || !navigator.onLine || (!force && this.covers(c))) return this.data;
+    if (this.busy) return this.busy;
+    this.busy = (async () => {
+      const dLat = RADIUS / 111, dLon = RADIUS / (111 * Math.max(.2, Math.cos(c.lat * Math.PI / 180)));
+      const b = [c.lat - dLat, c.lon - dLon, c.lat + dLat, c.lon + dLon].map(v => v.toFixed(3)).join(',');
+      const ql = `[out:json][timeout:60];(nwr["sport"="scuba_diving"][!"shop"][!"amenity"][!"tourism"](${b});nwr["scuba_diving:divespot"](${b});nwr["natural"="reef"]["name"](${b});nwr["historic"="wreck"]["name"](${b});nwr["seamark:type"="wreck"]["name"](${b}););out center tags qt;`;
+      const j = await fetchJSON('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(ql), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }, 70000);
+      const items = []; const seen = new Set();
+      for (const e of j.elements) {
+        const t = e.tags || {}; const lat = e.lat ?? e.center?.lat, lon = e.lon ?? e.center?.lon; const name = t.name || t['name:en']; if (!name || lat == null) continue;
+        if (kmBetween(c, { lat, lon }) > RADIUS) continue;
+        const k = norm(name) + Math.round(lat * 200) + ',' + Math.round(lon * 200); if (seen.has(k)) continue; seen.add(k);
+        const kind = t.historic === 'wreck' || t['seamark:type'] === 'wreck' ? 'wreck' : t.natural === 'reef' ? 'reef' : 'dive site';
+        items.push({ name, alt: [t['name:en'], t.alt_name, t.old_name, t.int_name, t['name:ar']].filter(Boolean).join(';'), lat: +lat.toFixed(6), lon: +lon.toFixed(6), kind, depth: t.depth || t.maxdepth || t['scuba_diving:maxdepth'] || '' });
+      }
+      this.data = { centre: { lat: c.lat, lon: c.lon }, label: c.label, at: Date.now(), items };
+      await DB.set('sitepack', this.data); return this.data;
+    })();
+    try { return await this.busy; } finally { this.busy = null; }
+  }
+};
+
 const Lookup = {
-  local(q) {
-    const k = norm(q); if (!k) return [];
-    return S.sites.map(s => {
-      const nm = norm(s.name); let score = 0;
-      if (nm === k) score = 3; else if (nm.startsWith(k)) score = 2; else if (nm.includes(k) || k.includes(nm)) score = 1.5;
-      else { const w = k.split(' ').filter(x => x.length > 2); const hit = w.filter(x => nm.includes(x)).length; if (hit) score = hit / w.length; }
-      return { s, score };
-    }).filter(x => x.score >= .5).sort((a, b) => b.score - a.score).slice(0, 6)
-      .map(({ s }) => ({ kind: 'mine', name: s.name, lat: s.lat, lon: s.lon, country: s.country, region: s.region, siteId: s.id, src: 'Your log', detail: `${S.dives.filter(d => d.siteId === s.id).length} dives` }));
+  local(q, c) { // your own sites
+    return S.sites.map(s => ({ s, score: Math.max(fuzzyScore(q, s.name), ...(s.aliasNames || []).map(a => fuzzyScore(q, a))) })).filter(x => x.score >= .5)
+      .sort((a, b) => b.score - a.score).slice(0, 5)
+      .map(({ s, score }) => ({ kind: 'mine', name: s.name, lat: s.lat, lon: s.lon, country: s.country, region: s.region, siteId: s.id, src: 'Your log', detail: `${S.dives.filter(d => d.siteId === s.id).length} dives`, score, km: c && s.lat != null ? kmBetween(c, s) : null }));
   },
-  async nominatim(q) {
-    const j = await fetchJSON(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&addressdetails=1&accept-language=en&q=${encodeURIComponent(q)}`);
-    return j.map(r => ({ kind: 'osm', name: r.name || r.display_name.split(',')[0], lat: +r.lat, lon: +r.lon, country: r.address?.country || '', region: r.address?.state || r.address?.county || '', src: 'OpenStreetMap', detail: r.display_name.split(',').slice(1, 3).join(',').trim() + (r.type ? ` · ${r.type.replace(/_/g, ' ')}` : '') }));
+  pack(q, c) {
+    if (!Pack.data) return [];
+    return Pack.data.items.map(it => ({ it, score: Math.max(fuzzyScore(q, it.name), ...(it.alt ? it.alt.split(';').map(a => fuzzyScore(q, a)) : [0])) })).filter(x => x.score >= .5)
+      .map(({ it, score }) => ({ kind: 'osm', name: it.name, lat: it.lat, lon: it.lon, src: `OpenStreetMap ${it.kind}`, detail: it.depth ? `depth ${it.depth}${/^[\d.]+$/.test(it.depth) ? ' m' : ''}` : '', score, km: c ? kmBetween(c, it) : null }))
+      .sort((a, b) => b.score - a.score || (a.km ?? 1e9) - (b.km ?? 1e9)).slice(0, 8);
   },
-  async overpass(q, near) {
-    if (!near) return [];
-    const re = q.replace(/[.*+?^${}()|[\]\\"]/g, ' ').trim().split(/\s+/).join('.*');
-    const b = [near.lat - 4, near.lon - 4, near.lat + 4, near.lon + 4].map(v => v.toFixed(3)).join(',');
-    const ql = `[out:json][timeout:12];(nwr["sport"="scuba_diving"]["name"~"${re}",i](${b});nwr["scuba_diving:divespot"]["name"~"${re}",i](${b});nwr["natural"="reef"]["name"~"${re}",i](${b}););out center 12;`;
-    const j = await fetchJSON('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(ql), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }, 14000);
-    return j.elements.map(e => ({ kind: 'osm', name: e.tags.name, lat: e.lat ?? e.center?.lat, lon: e.lon ?? e.center?.lon, src: 'OSM dive site', detail: [e.tags.natural, e.tags['scuba_diving:type'], e.tags.depth && `depth ${e.tags.depth}`].filter(Boolean).join(' · ') }));
+  async wiki(q, c, wide) { // only articles about reefs, wrecks or dive sites, inside the area unless wide
+    const j = await fetchJSON(`https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrlimit=10&gsrsearch=${encodeURIComponent(q + ' reef OR wreck OR diving')}&prop=coordinates|extracts&exintro=1&explaintext=1&exsentences=2`);
+    return Object.values(j.query?.pages || {}).filter(p => p.coordinates && /\b(reef|wreck|dive|diving|coral|shoal|atoll|seamount|pinnacle|cenote)\b/i.test(p.title + ' ' + (p.extract || '')))
+      .map(p => ({ kind: 'wiki', name: p.title, lat: p.coordinates[0].lat, lon: p.coordinates[0].lon, src: 'Wikipedia', detail: (p.extract || '').slice(0, 160), url: `https://en.wikipedia.org/wiki/${encodeURIComponent(p.title)}`, score: fuzzyScore(q, p.title), km: c ? kmBetween(c, { lat: p.coordinates[0].lat, lon: p.coordinates[0].lon }) : null }))
+      .filter(r => r.score >= .4 && (wide || !c || r.km <= RADIUS));
   },
-  async wiki(q) {
-    const j = await fetchJSON(`https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrlimit=5&gsrsearch=${encodeURIComponent(q + ' dive')}&prop=coordinates|extracts&exintro=1&explaintext=1&exsentences=2`);
-    return Object.values(j.query?.pages || {}).filter(p => p.coordinates).map(p => ({ kind: 'wiki', name: p.title, lat: p.coordinates[0].lat, lon: p.coordinates[0].lon, src: 'Wikipedia', detail: (p.extract || '').slice(0, 160), url: `https://en.wikipedia.org/wiki/${encodeURIComponent(p.title)}` }));
+  async worldOSM(q) { // worldwide: loose name match on the longest word, then fuzzy filter
+    const w = fkey(q).sort((a, b) => b.length - a.length)[0]; if (!w || w.length < 3) return [];
+    const re = w.slice(0, 4).replace(/[^a-z0-9]/g, '');
+    const ql = `[out:json][timeout:25];(nwr["sport"="scuba_diving"][!"shop"][!"amenity"]["name"~"${re}",i];nwr["natural"="reef"]["name"~"${re}",i];nwr["historic"="wreck"]["name"~"${re}",i];);out center tags 200;`;
+    const j = await fetchJSON('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(ql), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }, 30000);
+    return j.elements.map(e => ({ name: e.tags.name, lat: e.lat ?? e.center?.lat, lon: e.lon ?? e.center?.lon, kind: e.tags.historic === 'wreck' ? 'wreck' : e.tags.natural === 'reef' ? 'reef' : 'dive site' }))
+      .filter(r => r.name && r.lat != null).map(r => ({ kind: 'osm', name: r.name, lat: r.lat, lon: r.lon, src: `OpenStreetMap ${r.kind}`, detail: '', score: fuzzyScore(q, r.name) })).filter(r => r.score >= .55);
   },
   async reverse(lat, lon) {
     const j = await fetchJSON(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=8&accept-language=en&lat=${lat}&lon=${lon}`);
     return { country: j.address?.country || '', region: j.address?.state || j.address?.county || j.address?.region || '' };
-  },
-  async online(q, near) {
-    const res = await Promise.allSettled([this.nominatim(q), this.overpass(q, near), this.wiki(q)]);
-    const ok = res.filter(r => r.status === 'fulfilled').flatMap(r => r.value).filter(r => r.lat != null);
-    const failed = res.every(r => r.status === 'rejected');
-    // de-duplicate near-identical points
-    const out = [];
-    for (const r of ok) if (!out.some(o => Math.abs(o.lat - r.lat) < .002 && Math.abs(o.lon - r.lon) < .002)) out.push(r);
-    if (near) out.forEach(r => r.km = kmBetween(near, r)), out.sort((a, b) => (a.km ?? 1e9) - (b.km ?? 1e9));
-    return { results: out.slice(0, 8), failed };
   }
 };
+function dedupe(list) {
+  const out = []; for (const r of list) if (!out.some(o => o.lat != null && r.lat != null && Math.abs(o.lat - r.lat) < .003 && Math.abs(o.lon - r.lon) < .003 && fuzzyScore(o.name, r.name) > .6)) out.push(r);
+  return out;
+}
 
 /* ================= router & shell ================= */
 const VIEWS = { log: renderLog, stats: renderStats, certs: renderCerts, sign: renderSign };
@@ -1680,6 +1746,8 @@ function openEditor(id, opts = {}) {
   </form>`;
   sheet(isNew ? 'New dive' : `Edit dive #${D.num}`, body, `<button class="btn" data-act="close">Cancel</button><button class="btn primary" data-act="save-dive">${icon('check')}Save dive</button>`);
   bindEditor();
+  siteWide = false;
+  Centre.ask().then(c => { if (c) Pack.ensure(Centre.get()).catch(() => { }); });
 }
 function seg(k, opts, val) { return `<div class="seg" data-seg="${k}">${opts.map(([v, l]) => `<button type="button" data-v="${v}" aria-pressed="${(val ?? '') === v}">${l}</button>`).join('')}</div>`; }
 function datalists() {
@@ -1790,16 +1858,24 @@ function drawStars() {
 function drawPhotos() { const el = $('#photoList'); if (el) el.innerHTML = D.photos.map((p, i) => `<div style="position:relative"><img src="${p}" alt="" style="border-radius:10px;aspect-ratio:1;object-fit:cover;width:100%"><button type="button" class="iconbtn" style="position:absolute;top:4px;right:4px;width:32px;height:32px" data-act="del-photo" data-i="${i}" aria-label="Remove photo">${icon('close')}</button></div>`).join(''); }
 
 /* ---- site search inside editor ---- */
-let siteSeq = 0;
-const siteOnline = debounce(async (q, seq) => {
-  const box = $('#siteSugg'); if (!box || seq !== siteSeq) return;
-  if (!navigator.onLine) { renderSugg(q, Lookup.local(q), { offline: true }); return; }
-  renderSugg(q, Lookup.local(q), { loading: true });
-  const last = chrono().filter(d => d.id !== D.id).pop(); const near = Dmeta.site?.lat != null ? Dmeta.site : siteById(last?.siteId);
-  let r; try { r = await Lookup.online(q, near?.lat != null ? near : null); } catch (e) { r = { results: [], failed: true }; }
-  if (seq !== siteSeq) return;
-  renderSugg(q, Lookup.local(q), { online: r.results, failed: r.failed });
-}, 700);
+let siteSeq = 0, siteWide = false;
+async function searchSites(q, seq) {
+  const c = Centre.get();
+  const show = st => { if (seq === siteSeq) renderSugg(q, st); };
+  const base = () => dedupe([...Lookup.local(q, c), ...Lookup.pack(q, c)]);
+  show({ list: base(), c, loading: navigator.onLine });
+  if (!navigator.onLine) { show({ list: base(), c, offline: true }); return; }
+  const tasks = [];
+  if (c && !Pack.covers(c)) tasks.push(Pack.ensure(c).catch(() => { throw new Error('pack'); }));
+  tasks.push(Lookup.wiki(q, c, siteWide));
+  if (siteWide) tasks.push(Lookup.worldOSM(q));
+  const res = await Promise.allSettled(tasks);
+  const extra = res.filter(r => r.status === 'fulfilled' && Array.isArray(r.value)).flatMap(r => r.value).map(r => ({ ...r, km: c ? kmBetween(c, r) : null }));
+  const failed = res.every(r => r.status === 'rejected');
+  const list = dedupe([...Lookup.local(q, c), ...Lookup.pack(q, c), ...extra.sort((a, b) => b.score - a.score)]);
+  show({ list, c, failed, done: true });
+}
+const siteOnline = debounce((q, seq) => searchSites(q, seq), 500);
 function siteTyping(q) {
   siteSeq++;
   if (Dmeta.site && norm(Dmeta.site.name) !== norm(q)) { // typing a different name: detach from the chosen site
@@ -1807,25 +1883,27 @@ function siteTyping(q) {
     drawSiteCard();
   }
   if (q.trim().length < 2) { $('#siteSugg').innerHTML = ''; return; }
-  renderSugg(q, Lookup.local(q), {});
+  const c = Centre.get(); renderSugg(q, { list: dedupe([...Lookup.local(q, c), ...Lookup.pack(q, c)]), c });
   if (q.trim().length >= 3) siteOnline(q.trim(), siteSeq);
 }
 let suggCache = [];
-function renderSugg(q, local, st) {
+function renderSugg(q, st) {
   const box = $('#siteSugg'); if (!box) return;
-  suggCache = [...local, ...(st.online || [])];
-  const li = (r, i) => `<button type="button" data-act="pick-site" data-i="${i}">${icon(r.kind === 'mine' ? 'log' : r.kind === 'wiki' ? 'globe' : 'pin')}
+  suggCache = st.list.slice(0, 10);
+  const li = (r, i) => `<button type="button" data-act="pick-site" data-i="${i}">${icon(r.kind === 'mine' ? 'log' : r.kind === 'wiki' ? 'globe' : /wreck/.test(r.src) ? 't_wreck' : /reef/.test(r.src) ? 't_reef' : 'pin')}
     <div style="min-width:0"><div style="font-weight:600">${esc(r.name)}</div><div class="src">${esc(r.src)}</div>${r.detail ? `<div class="small muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.detail)}</div>` : ''}</div>
     <div class="d">${r.km != null ? fmt(r.km, 0) + ' km' : r.country ? esc(r.country) : ''}</div></button>`;
   let html = suggCache.length ? `<div class="sugg">${suggCache.map(li).join('')}</div>` : '';
-  const status = st.loading ? 'Searching OpenStreetMap, OSM dive sites and Wikipedia…'
-    : st.offline ? 'Offline: showing sites from your log only.'
-      : st.failed ? 'Online search unavailable (no connection, or blocked in this preview). Your log was searched.'
-        : st.online ? (st.online.length ? `${st.online.length} online match${st.online.length > 1 ? 'es' : ''}, nearest to your last dive first.` : 'No online match.') : '';
+  const area = siteWide ? 'worldwide' : st.c ? `within ${RADIUS} km of ${esc(st.c.label)}` : 'without a position (allow location, or log a dive with GPS)';
+  const pk = Pack.data ? ` Offline pack: ${Pack.data.items.length} dive sites.` : '';
+  const status = st.loading ? `Searching dive sites ${area}…`
+    : st.offline ? `Offline: your log and the offline pack were searched ${area}.${pk}`
+      : st.failed ? `Online search unavailable (no connection, or blocked in this preview). Your log${Pack.data ? ' and the offline pack' : ''} were searched.`
+        : st.done ? `${suggCache.length ? suggCache.length : 'No'} dive site${suggCache.length === 1 ? '' : 's'} found ${area}. Spelling variants included.${pk}` : '';
   html += status ? `<div class="hint" style="margin-top:6px">${status}</div>` : '';
-  const nothing = !st.loading && (st.online || st.offline || st.failed) && !suggCache.length;
-  html += `<button type="button" class="btn small" style="margin-top:8px" data-act="new-site">${icon('plus')}Use “${esc(q.trim())}” as a new site</button>`;
-  if (nothing) html += `<div class="hint" style="margin-top:6px">PADI does not publish its dive-site database. Create the site, then add its position with one of the methods shown.</div>`;
+  html += `<div class="row wrap" style="margin-top:8px"><button type="button" class="btn small" data-act="new-site">${icon('plus')}Use “${esc(q.trim())}” as a new site</button>
+    ${!siteWide && st.done ? `<button type="button" class="btn small" data-act="search-wide">${icon('globe')}Search worldwide</button>` : ''}</div>`;
+  if (st.done && !suggCache.length) html += `<div class="hint" style="margin-top:6px">Many small reefs are not mapped anywhere. Create the site, then set its position on the boat with “Use my position now”.</div>`;
   box.innerHTML = html;
 }
 async function pickSite(r) {
@@ -2398,6 +2476,8 @@ function openMore() {
       <div id="impZone"></div>
       <div class="row wrap"><button class="btn small" data-act="export-csv">${icon('download')}Dives as CSV (Excel)</button><button class="btn small" data-act="print">${icon('log')}Print / save logbook PDF</button></div>
       <div class="hint">Full backup includes signatures, stamps and certification scans. Save it to Google Drive after each trip.</div></div>
+    <div class="panel stack"><h3>Offline dive-site search</h3><div class="small">${Pack.data ? `${Pack.data.items.length} dive sites, reefs and wrecks within ${RADIUS} km of ${esc(Pack.data.label || 'the saved area')}, downloaded ${fmtDay(new Date(Pack.data.at).toISOString())}.` : 'Not downloaded yet. It downloads automatically when you have internet and a position.'} Source: OpenStreetMap.</div>
+      <button class="btn small" data-act="pack-refresh">${icon('download')}Download for my current area</button></div>
     <div class="panel stack"><h3>Appearance</h3><div class="seg" id="themeSeg">${[['system', 'System'], ['light', 'Light'], ['dark', 'Dark']].map(([v, l]) => `<button type="button" data-v="${v}" aria-pressed="${theme === v}">${l}</button>`).join('')}</div></div>
     <div class="panel stack"><h3>My equipment</h3><div class="hint">Only items you own. Rented gear is logged per dive with model and size. Set a service interval to get a reminder; leave it empty for no reminder.</div>
       ${S.gear.map(g => { const due = serviceDue(g); const n = S.dives.filter(d => (d.gear || []).some(e => e.itemId === g.id)).length; return `<div class="panel stack" style="padding:10px;${g.retired ? 'opacity:.55' : ''}">
@@ -2484,6 +2564,8 @@ document.addEventListener('click', async e => {
     case 'pick-map': openMapPicker(); break;
     case 'verify-gps': Dmeta.site.gpsVerified = true; drawSiteCard(); break;
     case 'import': openImport(); break;
+    case 'search-wide': siteWide = true; siteSeq++; searchSites($('#siteName').value.trim(), siteSeq); break;
+    case 'pack-refresh': { b.disabled = true; const c = (await Centre.ask(), Centre.get()); try { await Pack.ensure(c, true); toast(`${Pack.data.items.length} dive sites saved for offline search`); } catch (e) { toast('Could not download: check the connection'); } openMore(); break; }
     case 'rename-instead': { const nm = Dmeta.site.name; const coords = Dmeta.site.lat != null ? { lat: Dmeta.site.lat, lon: Dmeta.site.lon, gpsSource: Dmeta.site.gpsSource, gpsVerified: Dmeta.site.gpsVerified } : {};
       Dmeta.site = { ...Dmeta.prevSite, name: nm, ...coords }; D.siteId = Dmeta.site.id; Dmeta.prevSite = null; $('#siteName').value = nm; drawSiteCard(); drawSun(); break; }
     case 'merge-ask': { const t = siteById($('#mergeSel').value); const n2 = S.dives.filter(d => d.siteId === Dmeta.site.id).length;
@@ -2531,7 +2613,8 @@ window.addEventListener('hashchange', () => { closeSheet(); route(); });
 
 (async function init() {
   try { const t = localStorage.getItem('theme'); if (t && t !== 'system') document.documentElement.dataset.theme = t; } catch (e) { }
-  await load(); route();
+  await load(); Centre.load(); await Pack.load(); route();
+  setTimeout(() => { const c = Centre.get(); if (c) Pack.ensure(c).catch(() => { }); }, 3000);
   if ('serviceWorker' in navigator && window.isSecureContext && !window.IS_PREVIEW) navigator.serviceWorker.register('sw.js').catch(() => { });
 })();
 </script></body></html>
