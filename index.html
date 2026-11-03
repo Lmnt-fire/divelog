@@ -1267,15 +1267,32 @@ function sac(d) {
 }
 function gasLabel(g) { if (!g || g.mix === 'air') return 'Air'; return g.o2 ? `EAN${fmt(g.o2, 1)}` : 'Nitrox (% not logged)'; }
 function mod(o2, ppo2 = 1.4) { return o2 ? (ppo2 / (o2 / 100) - 1) * 10 : null; }
+// a trip = dives with no gap over 4 days and no jump over 500 km; region names and missing GPS never split a trip
 function trips() {
   const out = []; let cur = null;
   for (const d of chrono()) {
     const s = siteById(d.siteId) || {};
-    const key = s.region || s.country || '—';
-    if (!cur || toMs(d.start) - toMs(cur.last.start) > 4 * 864e5 || cur.key !== key) { cur = { key, region: key, country: s.country, dives: [], first: d }; out.push(cur); }
-    cur.dives.push(d); cur.last = d;
+    const far = cur && s.lat != null && cur.pos && kmBetween(cur.pos, s) > 500;
+    if (!cur || toMs(d.start) - toMs(cur.last.start) > 4 * 864e5 || far) { cur = { dives: [], first: d, pos: null }; out.push(cur); }
+    cur.dives.push(d); cur.last = d; if (s.lat != null) cur.pos = { lat: s.lat, lon: s.lon };
+  }
+  for (const t of out) {
+    const top = k => d3.rollups(t.dives.map(d => siteById(d.siteId)?.[k]).filter(Boolean), v => v.length, x => x).sort((a, b) => b[1] - a[1])[0]?.[0];
+    t.region = top('region') || top('country') || '—'; t.key = t.region; t.country = top('country') || '';
   }
   return out.reverse();
+}
+function fmtRange(a, b) { // dates the dives were done, e.g. "31 Oct – 3 Nov 2026"
+  const x = a.slice(0, 10), y = b.slice(0, 10); if (x === y) return fmtDay(x);
+  const [ya, ma, da] = x.split('-'), [yb, mb, db] = y.split('-');
+  if (ya !== yb) return `${fmtDay(x)} – ${fmtDay(y)}`;
+  return ma === mb ? `${+da}–${+db} ${MONTHS[+mb - 1]} ${yb}` : `${+da} ${MONTHS[+ma - 1]} – ${+db} ${MONTHS[+mb - 1]} ${yb}`;
+}
+// region/country of your nearest logged site within 50 km, so one area keeps one name
+function nearRegion(lat, lon, selfId) {
+  if (lat == null) return null;
+  const n = S.sites.filter(o => o.id !== selfId && o.lat != null && (o.region || o.country)).map(o => ({ o, km: kmBetween({ lat, lon }, o) })).filter(x => x.km <= 50).sort((a, b) => a.km - b.km)[0];
+  return n ? { region: n.o.region, country: n.o.country } : null;
 }
 function nextNum() { return Math.max(0, ...S.dives.map(d => d.num || 0)) + 1; }
 function lifeName(sp) { return sp.startsWith('custom:') ? sp.slice(7) : (SPECIES[sp]?.name || sp); }
@@ -1329,6 +1346,20 @@ function repairData() {
     const groups = {}; for (const st of S.sites) if (st.lat != null) (groups[st.lat.toFixed(4) + ',' + st.lon.toFixed(4)] = groups[st.lat.toFixed(4) + ',' + st.lon.toFixed(4)] || []).push(st);
     for (const g of Object.values(groups)) if (g.length > 1) for (const st of g) if (st.gpsVerified) { st.gpsVerified = false; st.gpsSource = `${st.gpsSource} · same point as ${g.filter(o => o !== st).map(o => o.name).join(', ')}`; }
     S.meta.fixes.push('sites-2026-10-31');
+  }
+  // c) 3 Nov 2026: sites added on a trip took the province name from OpenStreetMap (e.g. "Southwest Papua") instead of the area already in the log
+  if (!S.meta.fixes.includes('regions-2026-11-03')) {
+    const byAge = [...S.sites].sort((a, b) => (uidTime(a.id) || 0) - (uidTime(b.id) || 0));
+    const changed = {};
+    byAge.forEach((st, i) => {
+      if (st.lat == null) return;
+      const ref = byAge.slice(0, i).filter(o => o.lat != null && o.region).map(o => ({ o, km: kmBetween(st, o) })).filter(x => x.km <= 50).sort((a, b) => a.km - b.km)[0]?.o;
+      if (!ref || ref.region === st.region) return;
+      const key = `“${st.region || 'none'}” → “${ref.region}”`; (changed[key] = changed[key] || []).push(st.name);
+      st.region = ref.region; st.country = st.country || ref.country;
+    });
+    for (const [k, names] of Object.entries(changed)) notes.push(`Region ${k} for ${names.join(', ')} (same area as sites already in your log).`);
+    S.meta.fixes.push('regions-2026-11-03');
   }
   if (notes.length) { S.meta.repairLog = [...(S.meta.repairLog || []), ...notes.map(t => ({ at: new Date().toISOString().slice(0, 10), t }))]; save('sites', 'dives', 'meta'); setTimeout(() => toast(notes[0] + (notes.length > 1 ? ` (+${notes.length - 1} more, see Backup & settings)` : '')), 600); }
   else if (S.meta.fixes.length) save('sites', 'meta');
@@ -1584,7 +1615,7 @@ function drawLogList() {
     const ds = t.dives.filter(d => (!logYear || d.start.startsWith(logYear)) && diveMatches(d, logQuery));
     if (!ds.length) continue;
     const ops = [...new Set(t.dives.map(d => d.operator).filter(Boolean))].join(', ');
-    html += `<section class="trip"><div class="trip-h"><h2>${esc(t.region)}</h2><span class="meta">${fmtDay(t.first.start)} · ${t.dives.length} dive${t.dives.length > 1 ? 's' : ''}</span></div>
+    html += `<section class="trip"><div class="trip-h"><h2>${esc(t.region)}</h2><span class="meta">${fmtRange(t.first.start, t.last.start)} · ${t.dives.length} dive${t.dives.length > 1 ? 's' : ''}</span></div>
       ${ops ? `<div class="small muted" style="margin:-4px 2px 2px">${esc(ops)}</div>` : ''}
       ${ds.slice().reverse().map(diveRow).join('')}</section>`;
   }
@@ -1915,7 +1946,8 @@ async function pickSite(r) {
   }
   $('#siteName').value = Dmeta.site.name; $('#siteSugg').innerHTML = '';
   drawSiteCard(); drawSun();
-  if (!r.siteId && r.lat != null && navigator.onLine && !r.region) { try { const g = await Lookup.reverse(r.lat, r.lon); Object.assign(Dmeta.site, { country: g.country || Dmeta.site.country, region: g.region }); drawSiteCard(); } catch (e) { } }
+  if (!r.siteId && r.lat != null && !r.region) { const nr = nearRegion(r.lat, r.lon, Dmeta.site.id); if (nr) Object.assign(Dmeta.site, { region: nr.region || '', country: Dmeta.site.country || nr.country || '' }); }
+  if (!r.siteId && r.lat != null && navigator.onLine && !Dmeta.site.region) { try { const g = await Lookup.reverse(r.lat, r.lon); Object.assign(Dmeta.site, { country: g.country || Dmeta.site.country, region: g.region }); drawSiteCard(); } catch (e) { } }
 }
 function newSite() {
   const name = $('#siteName').value.trim(); if (!name) return;
@@ -1964,6 +1996,7 @@ function setSiteCoords(lat, lon, src, verified) {
   Object.assign(s, { lat, lon, gpsSource: src, gpsVerified: verified });
   if (!s.country) s.country = nearestCountry(lat, lon);
   drawSiteCard(); drawSun();
+  if (!s.region) { const nr = nearRegion(lat, lon, s.id); if (nr) { s.region = nr.region || ''; s.country = s.country || nr.country || ''; } }
   if (navigator.onLine && !s.region) Lookup.reverse(lat, lon).then(g => { if (!s.country) s.country = g.country; if (!s.region) s.region = g.region; drawSiteCard(); }).catch(() => { });
 }
 let sheetMap = null;
