@@ -1476,7 +1476,7 @@ function fuzzyScore(q, name) {
 
 /* ---- GPS marks: one tap on the boat; matched later to the dive by time ---- */
 const marks = () => (S.meta.marks = S.meta.marks || []);
-const markSrc = m => m.mode === 'track' ? `Phone location history at ${m.local.slice(11, 16)} (±${m.acc} m)` : `Your GPS mark at ${m.local.slice(11, 16)}, ${m.mode === 'after' ? 'exit point' : 'entry point'} (phone ±${m.acc} m)`;
+const markSrc = m => m.mode === 'track' ? `Phone ${m.src === 'GPS' ? 'GPS' : m.src === 'WIFI' ? 'Wi-Fi position' : 'location history'} at ${m.local.slice(11, 16)} (±${m.acc} m)` : `Your GPS mark at ${m.local.slice(11, 16)}, ${m.mode === 'after' ? 'exit point' : 'entry point'} (phone ±${m.acc} m)`;
 const markMode = () => S.meta.markMode || 'after'; // default: marked on the boat after surfacing
 function diveSpan(d) { // [entry, exit] in UTC ms; computer time if known, else wall clock read in the phone time zone
   const a = d.computer?.startUTC ?? (toMs(d.start) + new Date(toMs(d.start)).getTimezoneOffset() * 6e4);
@@ -1502,73 +1502,94 @@ function diveMark(d = D) {
   return best || trackPos(d);
 }
 
+const DIFF_KM = 1.5;
+const diveSite = d => ({ count: S.dives.filter(x => x.siteId === d.siteId).length });
+const phoneWord = m => m.mode === 'track' ? `Your phone (${m.src === 'GPS' ? 'GPS' : m.src === 'WIFI' ? 'Wi-Fi' : 'location history'}, ±${m.acc} m)` : 'Your GPS mark';
+// {m, km} when the phone was more than 1.5 km from the saved site position during this dive, unless you chose to keep the saved one
+function posDiff(d) {
+  const s = siteById(d.siteId); if (!s || s.lat == null) return null;
+  const m = diveMark(d); if (!m || d.posKept === m.t) return null;
+  const km = kmBetween(s, m); return km > DIFF_KM ? { m, km } : null;
+}
 /* ---- phone location history (Google Maps Timeline export, GPX): no tap needed ----
    The phone stays on the boat; the boat is at the site when you jump in. */
 const TRACK_WIN = 20 * 6e4;
 const localISO = t => new Date(t - new Date(t).getTimezoneOffset() * 6e4).toISOString().slice(0, 16);
 const track = () => (S.meta.track = S.meta.track || []);
+// only dives with an exact time: computer UTC, or a hand-logged dive of the last 30 days (phone still in that time zone)
 function trackPos(d) {
   if (!d?.start || !S.meta.track?.length) return null;
+  if (d.computer?.startUTC == null && toMs(d.start) < Date.now() - 30 * 864e5) return null;
   const [a, b] = diveSpan(d);
   let best = null, bs = Infinity;
   for (const p of S.meta.track) {
-    if (p.t < a - TRACK_WIN || p.t > b + TRACK_WIN || p.acc > 300) continue;
+    if (p.t < a - TRACK_WIN || p.t > b || p.acc > 150) continue; // boat waits near the site during the dive; after exit it moves on
     const sc = Math.abs(p.t - a) / 6e4 + p.acc / 50; // closest to entry time, then accuracy
     if (sc < bs) { bs = sc; best = p; }
   }
   if (!best) return null;
-  return { id: 'trk' + best.t, t: best.t, lat: best.lat, lon: best.lon, acc: best.acc, mode: 'track', local: new Date(best.t - new Date(best.t).getTimezoneOffset() * 6e4).toISOString().slice(0, 16) };
+  return { id: 'trk' + best.t, t: best.t, lat: best.lat, lon: best.lon, acc: best.acc, src: best.src, mode: 'track', local: new Date(best.t - new Date(best.t).getTimezoneOffset() * 6e4).toISOString().slice(0, 16) };
 }
 // reads Android Timeline.json (semanticSegments, rawSignals), iPhone Timeline export, Takeout Records.json and GPX
 function parseTrack(text) {
   const out = [];
   const ll = v => { if (v == null) return null; if (typeof v === 'object') { if (v.latitudeE7 != null) return [v.latitudeE7 / 1e7, v.longitudeE7 / 1e7]; v = v.latLng || v.LatLng || v.point; if (v == null) return null; }
     const m = String(v).replace(/^geo:/, '').match(/(-?\d+(?:\.\d+)?)\s*°?\s*,\s*(-?\d+(?:\.\d+)?)/); return m ? [+m[1], +m[2]] : null; };
-  const add = (pos, time, acc) => { const t = typeof time === 'number' ? time : Date.parse(time); if (!pos || !isFinite(t) || Math.abs(pos[0]) > 90 || Math.abs(pos[1]) > 180) return; out.push({ t, lat: +pos[0].toFixed(6), lon: +pos[1].toFixed(6), acc: Math.round(acc ?? 50) }); };
+  const add = (pos, time, acc, src) => { const t = typeof time === 'number' ? time : Date.parse(time); if (!pos || !isFinite(t) || Math.abs(pos[0]) > 90 || Math.abs(pos[1]) > 180) return; out.push({ t, lat: +pos[0].toFixed(6), lon: +pos[1].toFixed(6), acc: Math.round(acc ?? 50), ...(src ? { src } : {}) }); };
   if (/^\s*</.test(text)) { // GPX
     const doc = new DOMParser().parseFromString(text, 'application/xml');
-    for (const e of doc.querySelectorAll('trkpt, wpt, rtept')) { const tm = e.querySelector('time'); if (tm) add([+e.getAttribute('lat'), +e.getAttribute('lon')], tm.textContent.trim(), 15); }
+    for (const e of doc.querySelectorAll('trkpt, wpt, rtept')) { const tm = e.querySelector('time'); if (tm) add([+e.getAttribute('lat'), +e.getAttribute('lon')], tm.textContent.trim(), 15, 'GPS'); }
     return out;
   }
   const j = JSON.parse(text);
+  // Android raw signals carry the source. Cell-tower fixes are dropped: on a boat they point to the tower on shore (km off).
+  // Google keeps raw signals for about 30 days only, so older dives get nothing from an Android export.
+  const raw = (j.rawSignals || []).filter(r => r.position);
+  for (const r of raw) { const q = r.position, src = q.source || ''; if (src === 'GPS' || src === 'WIFI') add(ll(q), q.timestamp, q.accuracyMeters, src); }
   const segs = Array.isArray(j) ? j : j.semanticSegments || j.timelineObjects || [];
   for (const g of segs) {
     const st = g.startTime || g.duration?.startTimestamp, en = g.endTime || g.duration?.endTimestamp;
-    for (const p of g.timelinePath || []) add(ll(p.point ?? p), p.time || (st && p.durationMinutesOffsetFromStartTime != null ? Date.parse(st) + p.durationMinutesOffsetFromStartTime * 6e4 : null), 30);
-    const v = g.visit?.topCandidate?.placeLocation ?? g.placeVisit?.location; if (v) { const pos = ll(v); add(pos, st, 100); add(pos, en, 100); }
-    const ac = g.activity || g.activitySegment; if (ac) { add(ll(ac.start ?? ac.startLocation), st, 100); add(ll(ac.end ?? ac.endLocation), en, 100); }
+    if (j.rawSignals) break; // Android export: the derived path mixes in cell fixes, so only raw GPS/Wi-Fi is used
+    // path points only (no visits or trip start/end: those snap to places such as your hotel); source unknown, so ±150 m assumed
+    for (const p of g.timelinePath || []) add(ll(p.point ?? p), p.time || (st && p.durationMinutesOffsetFromStartTime != null ? Date.parse(st) + p.durationMinutesOffsetFromStartTime * 6e4 : null), 150);
   }
-  for (const r of j.rawSignals || []) if (r.position) add(ll(r.position), r.position.timestamp, r.position.accuracyMeters);
   for (const r of j.locations || []) add(ll(r), r.timestamp ? r.timestamp : +r.timestampMs, r.accuracy);
   return out;
 }
 async function importTrack(files) {
+  const box0 = $('#trkReport'); if (box0) box0.innerHTML = '<div class="small muted">Reading location history…</div>';
+  try { await importTrackRun(files); } catch (e) { console.error(e); if ($('#trkReport')) $('#trkReport').innerHTML = `<div class="notice warn">${icon('warn')}<div class="small">Import failed: ${esc(String(e.message || e))}. Nothing was changed.</div></div>`; }
+}
+async function importTrackRun(files) {
   let pts = [];
   for (const f of files) { try { pts = pts.concat(parseTrack(await f.text())); } catch (e) { toast(`${f.name}: not a location history or GPX file`); } }
   const box = $('#trkReport');
   if (!pts.length) { if (box) box.innerHTML = `<div class="notice warn">${icon('warn')}<div class="small">No positions with a time found in this file.</div></div>`; return; }
   // keep what can serve: points near logged dives, and the last 14 days for dives not imported yet
-  const spans = S.dives.filter(d => d.start).map(diveSpan), newest = Math.max(...pts.map(p => p.t));
+  let oldest = Infinity, newest = -Infinity; for (const p of pts) { if (p.t < oldest) oldest = p.t; if (p.t > newest) newest = p.t; } // no spread: 250,000+ points overflow the stack
+  const spans = S.dives.filter(d => d.start).map(diveSpan);
   const keep = p => p.t > newest - 14 * 864e5 || spans.some(([a, b]) => p.t > a - 3 * 36e5 && p.t < b + 3 * 36e5);
   const seen = new Set(track().map(p => p.t));
   for (const p of pts) if (keep(p) && !seen.has(p.t)) { seen.add(p.t); track().push(p); }
   S.meta.track.sort((a, b) => a.t - b.t); if (S.meta.track.length > 30000) S.meta.track = S.meta.track.slice(-30000);
   // fill sites that have no position; only report differences on the others
-  const filled = [], differ = [], none = [];
+  const filled = [], differ = [], none = [], ready = [];
   for (const d of chrono()) {
-    const st = siteById(d.siteId); const m = diveMark(d); if (!m) { if (st && st.lat == null) none.push(d); continue; }
-    if (!st) continue;
-    if (st.lat == null) { Object.assign(st, { lat: m.lat, lon: m.lon, gpsSource: markSrc(m), gpsVerified: m.acc <= 100 }); if (!st.country) st.country = nearestCountry(m.lat, m.lon); if (!st.region) { const nr = nearRegion(m.lat, m.lon, st.id); if (nr) { st.region = nr.region || ''; st.country = st.country || nr.country || ''; } } filled.push(d); }
+    const st = siteById(d.siteId); const m = diveMark(d); if (!m) { if (!st || st.lat == null) none.push(d); continue; }
+    if (!st) { ready.push(d); d.mark = { lat: m.lat, lon: m.lon, acc: m.acc, t: m.t, src: m.mode }; continue; }
+    if (st.lat == null) { Object.assign(st, { lat: m.lat, lon: m.lon, gpsSource: markSrc(m), gpsVerified: m.src === 'GPS' && m.acc <= 50 }); if (!st.country) st.country = nearestCountry(m.lat, m.lon); if (!st.region) { const nr = nearRegion(m.lat, m.lon, st.id); if (nr) { st.region = nr.region || ''; st.country = st.country || nr.country || ''; } } filled.push(d); }
     else { const km = kmBetween(st, m); if (km > 1.5) differ.push([d, km]); }
-    d.mark = { lat: m.lat, lon: m.lon, acc: m.acc, t: m.t, src: m.mode };
+    d.mark = { lat: m.lat, lon: m.lon, acc: m.acc, t: m.t, src: m.src || m.mode };
   }
   await save('meta', 'sites', 'dives');
-  const first = localISO(Math.min(...pts.map(p => p.t))), last = localISO(newest);
+  const first = localISO(oldest), last = localISO(newest);
   const nm = d => `#${d.num} ${esc(siteById(d.siteId)?.name || '(site not entered)')}`;
   if (box) box.innerHTML = `<div class="notice">${icon('check')}<div class="small"><b>${pts.length} positions read (${fmtDay(first)} – ${fmtDay(last)}).</b>
-    ${filled.length ? `<br>Position added: ${filled.map(nm).join(', ')}.` : '<br>No site without a position could be filled.'}
+    ${filled.length ? `<br>Position added: ${filled.map(nm).join(', ')}.` : ''}
+    ${ready.length ? `<br>Position ready for ${ready.map(nm).join(', ')}: open the dive and enter the site name; the position is filled in and nearby sites from your log are listed first.` : ''}
+    ${!filled.length && !ready.length ? '<br>No dive without a position could be filled.' : ''}
     ${differ.length ? `<br>Your phone was more than 1.5 km from the saved position on: ${differ.map(([d, km]) => `${nm(d)} (${fmt(km, 1)} km)`).join(', ')}. Open the dive to compare; nothing was changed.` : ''}
-    ${none.length ? `<br>No phone position during: ${none.slice(-6).map(nm).join(', ')}.` : ''}
+    ${none.length ? `<br>No phone GPS or Wi-Fi position between 20 min before entry and the end of the dive for: ${none.slice(-6).map(nm).join(', ')}.` : ''}
     <br>Dives you import later in the next 14 days get their position automatically.</div></div>`;
   route();
 }
@@ -1590,14 +1611,61 @@ function takeMark() {
     err => { if (err.code === 1 && !done) { stop(); toast('Location permission denied'); } }, { enableHighAccuracy: true, maximumAge: 0, timeout: 25000 });
   tm = setTimeout(finish, 26000);
 }
+/* ---- Boat mode: GPS logger inside the app. A web app cannot record with the screen off,
+   so it keeps the screen awake and shows a black screen (OLED pixels off) to save battery. ---- */
+const Boat = {
+  on: false, watch: null, lock: null, n: 0, last: null, lastFix: null, t0: 0, tick: null, dirty: false,
+  async start() {
+    if (!navigator.geolocation) { toast('Location is not available on this device'); return; }
+    this.on = true; this.n = 0; this.t0 = Date.now(); this.last = null; this.lastFix = null;
+    document.body.insertAdjacentHTML('beforeend', `<div id="boat" style="position:fixed;inset:0;z-index:9999;background:#000;color:#555;display:flex;flex-direction:column;justify-content:flex-end;padding:24px 20px calc(24px + env(safe-area-inset-bottom));font:13px/1.5 var(--font,system-ui);touch-action:none;user-select:none">
+      <div id="boatTxt">Starting GPS…</div><div style="margin-top:14px;color:#444">Hold here 2 s to stop</div></div>`);
+    const el = $('#boat'); let hold = null;
+    el.addEventListener('pointerdown', () => { hold = setTimeout(() => this.stop(), 2000); });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev => el.addEventListener(ev, () => clearTimeout(hold)));
+    await this.wake();
+    this.watch = navigator.geolocation.watchPosition(p => this.fix(p), err => { if (err.code === 1) { this.stop(); toast('Location permission denied'); } }, { enableHighAccuracy: true, maximumAge: 0, timeout: 60000 });
+    this.tick = setInterval(() => { this.draw(); if (this.dirty) { this.dirty = false; save('meta'); } if (Date.now() - this.t0 > 12 * 36e5) this.stop(); }, 60000);
+    document.addEventListener('visibilitychange', this.vis);
+    this.draw();
+  },
+  vis: () => { if (document.visibilityState === 'visible' && Boat.on) { Boat.wake(); Boat.draw(); } },
+  async wake() { try { this.lock = await navigator.wakeLock?.request('screen'); } catch (e) { this.lock = null; } },
+  fix(p) {
+    const c = p.coords, t = Date.now(); this.lastFix = { t, acc: Math.round(c.accuracy) };
+    if (c.accuracy <= 100) {
+      const q = { t, lat: +c.latitude.toFixed(6), lon: +c.longitude.toFixed(6), acc: Math.round(c.accuracy), src: 'GPS' };
+      // one point every 30 s, or sooner after moving 100 m
+      if (!this.last || t - this.last.t >= 30000 || kmBetween(this.last, q) > .1) { track().push(q); this.last = q; this.n++; this.dirty = true; }
+    }
+    this.draw();
+  },
+  draw() {
+    const el = $('#boatTxt'); if (!el) return;
+    const age = this.lastFix ? Math.round((Date.now() - this.lastFix.t) / 1000) : null;
+    el.innerHTML = `<b style="color:#777">Boat mode · recording GPS</b><br>Since ${localISO(this.t0).slice(11, 16)} · ${this.n} positions saved<br>
+      ${this.lastFix ? `Last fix ${age < 90 ? age + ' s' : Math.round(age / 60) + ' min'} ago · ±${this.lastFix.acc} m${this.lastFix.acc > 100 ? ' (too rough, not saved)' : ''}` : 'Waiting for the first fix…'}<br>
+      ${this.lock ? 'Screen kept on. Leave the app open; do not lock the phone.' : '<span style="color:#a55">This phone does not allow keeping the screen on: set screen timeout to 30 min.</span>'}`;
+  },
+  async stop() {
+    if (!this.on) return; this.on = false;
+    navigator.geolocation.clearWatch(this.watch); clearInterval(this.tick); document.removeEventListener('visibilitychange', this.vis);
+    try { await this.lock?.release(); } catch (e) {} this.lock = null;
+    $('#boat')?.remove(); await save('meta');
+    toast(`Boat mode stopped · ${this.n} positions saved`); route();
+  },
+};
 function openMarks(fresh) {
   const ms = marks().slice().sort((a, b) => b.t - a.t).slice(0, 20);
   const owner = m => S.dives.find(d => diveMark(d) === m);
-  sheet(fresh ? 'Site marked' : 'GPS marks', `
+  sheet(fresh ? 'Site marked' : 'Site positions', `
     ${fresh ? `<div class="notice">${icon('check')}<div class="small"><b class="num">${fresh.lat.toFixed(5)}, ${fresh.lon.toFixed(5)}</b> · ±${fresh.acc} m · ${fresh.local.slice(11, 16)}<br>${fresh.mode === 'after' ? 'The dive you just finished gets this position as its exit point, once you log or import it. Mark within 60 min of surfacing, before the boat moves on.' : 'The dive you are about to do gets this position as its entry point, once you log or import it.'}</div></div>` : `<div class="small">One tap on the boat saves the phone's GPS position. The dive logged or imported for that time then gets it automatically, even if no database knows the site.</div>`}
     <div class="stack" style="gap:6px"><div class="small"><b>I mark the site</b></div><div class="seg" id="markModeSeg">${[['after', 'After surfacing'], ['before', 'Before entry']].map(([v, l]) => `<button type="button" data-v="${v}" aria-pressed="${markMode() === v}">${l}</button>`).join('')}</div>
       <div class="hint">${markMode() === 'after' ? 'Exit point: on drift dives it can be 1–2 km from the entry. Up to 60 min after surfacing.' : 'Entry point: up to 90 min before entry.'}</div></div>
-    <div class="row wrap"><button class="btn primary" data-act="mark">${icon('gps')}${fresh ? 'Mark again' : 'Mark site now'}</button></div>
+    ${fresh ? '' : `<div class="panel stack"><h3>Boat mode</h3><div class="small">Start it on the jetty, before you board. The app records GPS every 30 s while it stays open, with a black screen. Each dive you import then takes the boat position at entry. Stop it when you are back (hold the screen 2 s).</div>
+      <div class="hint">A web app cannot record with the screen off. Expect roughly 5–10% battery per hour; carry a power bank on long days.</div>
+      <button class="btn primary" data-act="boat">${icon('gps')}Start boat mode</button></div>`}
+    <div class="row wrap"><button class="btn ${fresh ? 'primary' : ''}" data-act="mark">${icon('gps')}${fresh ? 'Mark again' : 'Mark site now'}</button></div>
     <div class="hint">Shortcut: long-press the Dive Log icon on your home screen and choose “Mark dive site”.</div>
     <div class="panel stack"><h3>Recent marks</h3>${ms.length ? ms.map(m => { const d = owner(m), st = d && siteById(d.siteId);
       return `<div class="row"><div class="grow small"><b class="num">${fmtDate(m.local)}</b> · ±${m.acc} m · ${m.mode === 'after' ? 'exit' : 'entry'}<br><span class="muted">${d ? `Dive #${d.num ?? ''} ${esc(st?.name || '(site not entered)')}` : 'No dive logged for this time yet'}</span></div><button class="iconbtn" data-act="mark-del" data-id="${m.id}" aria-label="Delete mark">${icon('close')}</button></div>`; }).join('') : '<div class="small muted">None yet.</div>'}</div>`);
@@ -1745,7 +1813,7 @@ function diveRow(d) {
       ${d.life?.length ? `<div class="life" aria-label="Marine life">${d.life.slice(0, 7).map(l => icon(lifeIcon(l.sp))).join('')}</div>` : ''}
       <div class="flags">${sig.length ? `<span class="badge ${changed ? 'warn' : 'ok'}">${icon(changed ? 'warn' : 'shield')}${changed ? 'Changed after signing' : 'Signed'}</span>` : ''}
         ${d.computer ? `<span class="badge">${icon('t_deep')}Computer</span>` : ''}
-        ${!d.siteId ? '' : s.lat == null ? `<span class="badge warn">${icon('pin')}No GPS</span>` : (!s.gpsVerified ? `<span class="badge">${icon('pin')}GPS to check</span>` : '')}
+        ${!d.siteId ? (diveMark(d) ? `<span class="badge ok">${icon('gps')}Position ready</span>` : '') : s.lat == null ? `<span class="badge warn">${icon('pin')}No GPS</span>` : (() => { const pd = posDiff(d); return pd ? `<span class="badge warn">${icon('gps')}Phone ${fmt(pd.km, 1)} km away</span>` : !s.gpsVerified ? `<span class="badge">${icon('pin')}GPS to check</span>` : ''; })()}
         ${(d.types || []).includes('night') ? `<span class="badge">${icon('t_night')}Night</span>` : ''}</div>
     </div>
     <div class="fig"><b>${fmt(d.maxDepth, 1)}</b> m<br>${fmt(d.duration)} min${d.waterTemp != null ? `<br><span class="muted">${fmt(d.waterTemp)}°C</span>` : ''}</div>
@@ -1799,6 +1867,11 @@ function openDive(id) {
       ${s.lat != null ? `<div class="row wrap"><span class="num">${s.lat.toFixed(5)}, ${s.lon.toFixed(5)}</span>
         <span class="badge ${s.gpsVerified ? 'ok' : 'warn'}">${s.gpsVerified ? 'GPS logged' : 'To check'}</span></div>
         <div class="small muted">Source: ${esc(s.gpsSource || '–')}</div>
+        ${(() => { const pd = posDiff(d); if (!pd) return ''; const m = pd.m;
+          return `<div class="notice warn">${icon('warn')}<div class="small grow">${phoneWord(m)} was <b>${fmt(pd.km, 1)} km</b> from this position at ${m.local.slice(11, 16)}, during the dive: <span class="num">${m.lat.toFixed(5)}, ${m.lon.toFixed(5)}</span>.
+            <div class="row wrap" style="margin-top:6px"><button class="btn small water" data-act="use-phone" data-id="${d.id}">Use the phone position</button><button class="btn small" data-act="keep-pos" data-id="${d.id}">Keep the saved one</button>
+            <a class="btn small" target="_blank" rel="noopener" href="https://www.google.com/maps/search/?api=1&query=${m.lat},${m.lon}">${icon('pin')}See phone position</a></div>
+            ${diveSite(d).count > 1 ? `<div class="hint">The site is used by ${diveSite(d).count} dives; its position changes for all of them.</div>` : ''}</div></div>`; })()}
         <div class="row wrap"><a class="btn small" target="_blank" rel="noopener" href="https://www.google.com/maps/search/?api=1&query=${s.lat},${s.lon}">${icon('pin')}Google Maps</a>
         <a class="btn small" target="_blank" rel="noopener" href="https://www.openstreetmap.org/?mlat=${s.lat}&mlon=${s.lon}#map=13/${s.lat}/${s.lon}">${icon('globe')}OpenStreetMap</a></div>`
       : `<div class="notice warn">${icon('warn')}<div>No GPS for this site yet. Edit the dive to search, paste coordinates or drop a pin.</div></div>`}</div>
@@ -2124,9 +2197,10 @@ function drawSiteCard() {
       ${near.length ? `<details class="small"><summary>Same place as another site? Merge</summary><div class="row" style="margin-top:6px"><select id="mergeSel" aria-label="Merge into">${near.map(x => `<option value="${x.o.id}">${esc(x.o.name)}${x.km != null ? ` · ${fmt(x.km, 1)} km` : ''}</option>`).join('')}</select><button type="button" class="btn small" data-act="merge-ask">Merge</button></div><div id="mergeZone"></div></details>` : ''}
     </div></div>
     ${(() => { const m = diveMark(); if (!m) return ''; const km = has ? kmBetween(s, m) : null;
-      if (has && (km < 1 || s.gpsSource === markSrc(m))) return '';
-      return `<div class="notice">${icon('gps')}<div class="small grow">${has ? `Your GPS mark at ${m.local.slice(11, 16)} is <b>${fmt(km, 1)} km</b> from this site's position.` : `You marked a position at ${m.local.slice(11, 16)} (${m.mode === 'after' ? 'exit point, ' : ''}±${m.acc} m).`}
-        <div style="margin-top:6px"><button type="button" class="btn small water" data-act="use-mark">Use my mark as the site position</button></div></div></div>`; })()}
+      if (has && (km <= DIFF_KM || s.gpsSource === markSrc(m) || D.posKept === m.t)) return '';
+      const who = m.mode === 'track' ? phoneWord(m) + ' was' : `Your GPS mark (${m.mode === 'after' ? 'exit point, ' : ''}±${m.acc} m) is`;
+      return `<div class="notice">${icon('gps')}<div class="small grow">${has ? `${who} <b>${fmt(km, 1)} km</b> from this site's position (${m.local.slice(11, 16)}).` : `${who} here at ${m.local.slice(11, 16)}.`}
+        <div style="margin-top:6px"><button type="button" class="btn small water" data-act="use-mark">Use ${m.mode === 'track' ? 'the phone position' : 'my mark'} as the site position</button></div></div></div>`; })()}
     <div class="fallback panel"><h3>${has ? 'Change position' : 'Find the GPS position'}</h3>
       <div class="row wrap"><button type="button" class="btn small water" data-act="gps-now">${icon('gps')}Use my position now</button><button type="button" class="btn small" data-act="pick-map">${icon('pin')}Pick on map</button></div>
       <div class="row"><input type="text" id="coordIn" placeholder="Paste 24.92, 35.86 · 24°55′N 35°51′E · Maps link" aria-label="Paste coordinates"><button type="button" class="btn small" data-act="coord-apply">Set</button></div>
@@ -2246,7 +2320,7 @@ function openImport() {
       <label class="btn primary" style="cursor:pointer">${icon('upload')}Choose .fit files<input type="file" id="fitIn" accept=".fit,application/octet-stream,application/vnd.ant.fit" multiple hidden></label></div>
     <div id="fitReport" class="stack"></div>
     <div class="panel stack"><h3>3 · Site positions from your phone (optional)</h3>
-      <div class="small">No tapping needed. If Google Maps Timeline is on, your phone records where it was while it sat on the boat. Each dive takes the phone's position at entry time (±20 min). Sites that already have a position are not changed.</div>
+      <div class="small">No tapping needed. If Google Maps Timeline is on, your phone records where it was while it sat on the boat. Each dive takes the phone's GPS or Wi-Fi position closest to entry time, from 20 min before entry to the end of the dive. Cell-tower positions are ignored (km off at sea). Sites that already have a position are not changed.</div>
       <ol class="small" style="margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px"><li>Android: Settings → Location → Location services → Timeline → <b>Export Timeline data</b>. Save the file.</li><li>Or a .gpx file from any GPS logger app running on the boat.</li></ol>
       <label class="btn" style="cursor:pointer">${icon('upload')}Choose Timeline .json or .gpx<input type="file" id="trkIn" accept=".json,.gpx,application/json,application/gpx+xml,text/xml" multiple hidden></label>
       ${S.meta.track?.length ? `<div class="hint">${S.meta.track.length} positions stored, ${fmtDay(localISO(S.meta.track[0].t))} – ${fmtDay(localISO(S.meta.track.at(-1).t))}.</div>` : ''}<div id="trkReport"></div></div>`);
@@ -2746,6 +2820,11 @@ document.addEventListener('click', async e => {
     case 'marks': openMarks(); break;
     case 'mark': closeSheet(); takeMark(); break;
     case 'mark-del': S.meta.marks = marks().filter(m => m.id !== id); await save('meta'); openMarks(); break;
+    case 'use-phone': { const d = S.dives.find(x => x.id === id), st = d && siteById(d.siteId), m = d && diveMark(d);
+      if (st && m) { const old = `${st.lat.toFixed(5)}, ${st.lon.toFixed(5)}`; Object.assign(st, { lat: m.lat, lon: m.lon, gpsSource: markSrc(m), gpsVerified: m.src === 'GPS' && m.acc <= 50, notes: [st.notes, `Position replaced ${new Date().toISOString().slice(0, 10)} (was ${old})`].filter(Boolean).join('\n') });
+        await save('sites'); toast(`${st.name}: position updated`); route(); openDive(id); } break; }
+    case 'keep-pos': { const d = S.dives.find(x => x.id === id), m = d && diveMark(d); if (m) { d.posKept = m.t; await save('dives'); toast('Saved position kept'); route(); openDive(id); } break; }
+    case 'boat': closeSheet(); Boat.start(); break;
     case 'use-mark': { const m = diveMark(); if (m) { setSiteCoords(m.lat, m.lon, markSrc(m), true); toast('Position set from your mark'); } break; }
     case 'gps-now':
       if (!navigator.geolocation) { toast('Location is not available here'); break; }
