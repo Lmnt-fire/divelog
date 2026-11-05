@@ -1614,45 +1614,80 @@ function takeMark() {
 /* ---- Boat mode: GPS logger inside the app. A web app cannot record with the screen off,
    so it keeps the screen awake and shows a black screen (OLED pixels off) to save battery. ---- */
 const Boat = {
-  on: false, watch: null, lock: null, n: 0, last: null, lastFix: null, t0: 0, tick: null, dirty: false,
+  on: false, watch: null, lock: null, last: null, t0: 0, tick: null, dirty: false, st: null, hiddenAt: null,
   async start() {
     if (!navigator.geolocation) { toast('Location is not available on this device'); return; }
-    this.on = true; this.n = 0; this.t0 = Date.now(); this.last = null; this.lastFix = null;
-    document.body.insertAdjacentHTML('beforeend', `<div id="boat" style="position:fixed;inset:0;z-index:9999;background:#000;color:#555;display:flex;flex-direction:column;justify-content:flex-end;padding:24px 20px calc(24px + env(safe-area-inset-bottom));font:13px/1.5 var(--font,system-ui);touch-action:none;user-select:none">
+    this.on = true; this.t0 = Date.now(); this.last = null;
+    this.st = { start: this.t0, fixes: 0, saved: 0, best: null, lastAcc: null, lastT: null, err: {}, lastErr: '', hiddenMin: 0, wake: false };
+    document.body.insertAdjacentHTML('beforeend', `<div id="boat" style="position:fixed;inset:0;z-index:9999;background:#000;color:#666;display:flex;flex-direction:column;justify-content:flex-end;padding:24px 20px calc(24px + env(safe-area-inset-bottom));font:13px/1.55 var(--font,system-ui);touch-action:none;user-select:none">
       <div id="boatTxt">Starting GPS…</div><div style="margin-top:14px;color:#444">Hold here 2 s to stop</div></div>`);
     const el = $('#boat'); let hold = null;
     el.addEventListener('pointerdown', () => { hold = setTimeout(() => this.stop(), 2000); });
     ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev => el.addEventListener(ev, () => clearTimeout(hold)));
-    await this.wake();
-    this.watch = navigator.geolocation.watchPosition(p => this.fix(p), err => { if (err.code === 1) { this.stop(); toast('Location permission denied'); } }, { enableHighAccuracy: true, maximumAge: 0, timeout: 60000 });
-    this.tick = setInterval(() => { this.draw(); if (this.dirty) { this.dirty = false; save('meta'); } if (Date.now() - this.t0 > 12 * 36e5) this.stop(); }, 60000);
+    await this.wake(); this.listen();
+    // backup poll: some phones stop delivering watchPosition updates; ask directly when nothing came for 25 s
+    this.tick = setInterval(() => {
+      if (!this.on) return;
+      if (!this.st.lastT || Date.now() - this.st.lastT > 25000) navigator.geolocation.getCurrentPosition(p => this.fix(p), e => this.err(e), { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+      if (this.dirty) { this.dirty = false; save('meta'); }
+      if (Date.now() - this.t0 > 12 * 36e5) this.stop();
+      this.draw();
+    }, 20000);
     document.addEventListener('visibilitychange', this.vis);
     this.draw();
   },
-  vis: () => { if (document.visibilityState === 'visible' && Boat.on) { Boat.wake(); Boat.draw(); } },
-  async wake() { try { this.lock = await navigator.wakeLock?.request('screen'); } catch (e) { this.lock = null; } },
+  listen() {
+    if (this.watch != null) navigator.geolocation.clearWatch(this.watch);
+    this.watch = navigator.geolocation.watchPosition(p => this.fix(p), e => this.err(e), { enableHighAccuracy: true, maximumAge: 0, timeout: 60000 });
+  },
+  vis: () => {
+    if (!Boat.on) return;
+    if (document.visibilityState === 'hidden') Boat.hiddenAt = Date.now();
+    else { if (Boat.hiddenAt) Boat.st.hiddenMin += (Date.now() - Boat.hiddenAt) / 6e4; Boat.hiddenAt = null; Boat.wake(); Boat.listen(); Boat.draw(); }
+  },
+  async wake() { try { this.lock = await navigator.wakeLock?.request('screen'); this.st.wake = !!this.lock; this.lock?.addEventListener('release', () => { this.st.wake = false; this.draw(); }); } catch (e) { this.lock = null; this.st.wake = false; } },
+  err(e) {
+    if (!this.on) return; this.st.err[e.code] = (this.st.err[e.code] || 0) + 1; this.st.lastErr = e.code === 1 ? 'permission denied' : e.code === 2 ? 'position unavailable' : 'timeout';
+    if (e.code === 1) { this.stop(); return; } this.draw();
+  },
   fix(p) {
-    const c = p.coords, t = Date.now(); this.lastFix = { t, acc: Math.round(c.accuracy) };
-    if (c.accuracy <= 100) {
-      const q = { t, lat: +c.latitude.toFixed(6), lon: +c.longitude.toFixed(6), acc: Math.round(c.accuracy), src: 'GPS' };
+    if (!this.on) return;
+    const c = p.coords, t = Date.now(), acc = Math.round(c.accuracy), st = this.st;
+    st.fixes++; st.lastAcc = acc; st.lastT = t; st.lastErr = ''; if (st.best == null || acc < st.best) st.best = acc;
+    if (acc <= 100) {
+      const q = { t, lat: +c.latitude.toFixed(6), lon: +c.longitude.toFixed(6), acc, src: 'GPS' };
       // one point every 30 s, or sooner after moving 100 m
-      if (!this.last || t - this.last.t >= 30000 || kmBetween(this.last, q) > .1) { track().push(q); this.last = q; this.n++; this.dirty = true; }
+      if (!this.last || t - this.last.t >= 30000 || kmBetween(this.last, q) > .1) { track().push(q); this.last = q; st.saved++; this.dirty = true; }
     }
     this.draw();
   },
+  // plain-language reason when nothing usable arrives
+  why(st) {
+    if (st.err[1]) return 'Location permission is blocked for this app. Android Settings → Apps → Chrome → Permissions → Location: Allow, and turn on “Use precise location”.';
+    if (!st.fixes) return st.err[2] || st.err[3] ? `No position received (${st.lastErr}). Check that Location is on in the quick settings, and try outdoors.` : 'No position received yet.';
+    if (st.best > 1000) return `Only approximate positions (best ±${st.best} m). Chrome probably has “approximate” location: Android Settings → Apps → Chrome → Permissions → Location → turn on “Use precise location”.`;
+    if (st.best > 100) return `GPS too weak (best ±${st.best} m; positions need ±100 m or better). Indoors or under a roof? Try in the open for 2–3 minutes.`;
+    return '';
+  },
   draw() {
-    const el = $('#boatTxt'); if (!el) return;
-    const age = this.lastFix ? Math.round((Date.now() - this.lastFix.t) / 1000) : null;
-    el.innerHTML = `<b style="color:#777">Boat mode · recording GPS</b><br>Since ${localISO(this.t0).slice(11, 16)} · ${this.n} positions saved<br>
-      ${this.lastFix ? `Last fix ${age < 90 ? age + ' s' : Math.round(age / 60) + ' min'} ago · ±${this.lastFix.acc} m${this.lastFix.acc > 100 ? ' (too rough, not saved)' : ''}` : 'Waiting for the first fix…'}<br>
-      ${this.lock ? 'Screen kept on. Leave the app open; do not lock the phone.' : '<span style="color:#a55">This phone does not allow keeping the screen on: set screen timeout to 30 min.</span>'}`;
+    const el = $('#boatTxt'); if (!el || !this.st) return; const st = this.st;
+    const age = st.lastT ? Math.round((Date.now() - st.lastT) / 1000) : null, w = !st.saved ? this.why(st) : '';
+    el.innerHTML = `<b style="color:#888">Boat mode · recording GPS</b><br>Since ${localISO(this.t0).slice(11, 16)} · <b style="color:#888">${st.saved}</b> positions saved · ${st.fixes} fixes received${st.best != null ? ` · best ±${st.best} m` : ''}<br>
+      ${st.lastT ? `Last fix ${age < 90 ? age + ' s' : Math.round(age / 60) + ' min'} ago · ±${st.lastAcc} m${st.lastAcc > 100 ? ' (too rough, not saved)' : ''}` : 'Waiting for the first fix…'}
+      ${st.lastErr ? `<br>Last error: ${st.lastErr}` : ''}${st.hiddenMin >= 1 ? `<br><span style="color:#a77">Not recording for ${Math.round(st.hiddenMin)} min while the screen was off or the app was in the background.</span>` : ''}
+      <br>${st.wake ? 'Screen kept on. Leave the app open; do not lock the phone.' : '<span style="color:#a77">The screen is not being kept on. Set Android screen timeout to 30 min, or recording stops when the screen turns off.</span>'}
+      ${w ? `<br><span style="color:#b98">${w}</span>` : ''}`;
   },
   async stop() {
     if (!this.on) return; this.on = false;
-    navigator.geolocation.clearWatch(this.watch); clearInterval(this.tick); document.removeEventListener('visibilitychange', this.vis);
+    if (this.watch != null) navigator.geolocation.clearWatch(this.watch); this.watch = null; clearInterval(this.tick); document.removeEventListener('visibilitychange', this.vis);
     try { await this.lock?.release(); } catch (e) {} this.lock = null;
+    if (this.hiddenAt) this.st.hiddenMin += (Date.now() - this.hiddenAt) / 6e4;
+    const st = { ...this.st, end: Date.now(), why: this.st.saved ? '' : this.why(this.st) };
+    S.meta.boatLog = [st, ...(S.meta.boatLog || [])].slice(0, 10);
     $('#boat')?.remove(); await save('meta');
-    toast(`Boat mode stopped · ${this.n} positions saved`); route();
+    toast(`Boat mode stopped · ${st.saved} positions saved`); route();
+    if (!st.saved) setTimeout(() => openMarks(), 400);
   },
 };
 function openMarks(fresh) {
@@ -1664,7 +1699,8 @@ function openMarks(fresh) {
       <div class="hint">${markMode() === 'after' ? 'Exit point: on drift dives it can be 1–2 km from the entry. Up to 60 min after surfacing.' : 'Entry point: up to 90 min before entry.'}</div></div>
     ${fresh ? '' : `<div class="panel stack"><h3>Boat mode</h3><div class="small">Start it on the jetty, before you board. The app records GPS every 30 s while it stays open, with a black screen. Each dive you import then takes the boat position at entry. Stop it when you are back (hold the screen 2 s).</div>
       <div class="hint">A web app cannot record with the screen off. Expect roughly 5–10% battery per hour; carry a power bank on long days.</div>
-      <button class="btn primary" data-act="boat">${icon('gps')}Start boat mode</button></div>`}
+      <button class="btn primary" data-act="boat">${icon('gps')}Start boat mode</button>
+      ${(S.meta.boatLog || []).length ? `<div class="stack" style="gap:4px"><div class="small"><b>Recent sessions</b></div>${S.meta.boatLog.slice(0, 5).map(x => `<div class="small"><span class="num">${fmtDate(localISO(x.start))}–${localISO(x.end).slice(11, 16)}</span> · <b>${x.saved}</b> saved · ${x.fixes} fixes${x.best != null ? ` · best ±${x.best} m` : ''}${x.hiddenMin >= 1 ? ` · ${Math.round(x.hiddenMin)} min screen off` : ''}${x.wake ? '' : ' · screen not kept on'}${x.why ? `<br><span style="color:var(--warn)">${esc(x.why)}</span>` : ''}</div>`).join('')}</div>` : ''}</div>`}
     <div class="row wrap"><button class="btn ${fresh ? 'primary' : ''}" data-act="mark">${icon('gps')}${fresh ? 'Mark again' : 'Mark site now'}</button></div>
     <div class="hint">Shortcut: long-press the Dive Log icon on your home screen and choose “Mark dive site”.</div>
     <div class="panel stack"><h3>Recent marks</h3>${ms.length ? ms.map(m => { const d = owner(m), st = d && siteById(d.siteId);
