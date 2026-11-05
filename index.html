@@ -1447,14 +1447,18 @@ async function fetchJSON(url, opt = {}, ms = 8000) {
 }
 /* ================= dive-site search: fuzzy, local-first, area-bound ================= */
 // Spelling tolerance: transliteration variants (Arabic, Indonesian, Spanish), generic words removed, doubled letters collapsed.
-const GENERIC = new Set(['reef', 'reefs', 'riff', 'recif', 'arrecife', 'karang', 'terumbu', 'dive', 'site', 'spot', 'point', 'the', 'el', 'al', 'il', 'la', 'le', 'de', 'del', 'di', 'of', 'north', 'south', 'east', 'west', 'nord', 'sud', 'island', 'isla', 'ile', 'pulau', 'gili', 'wreck', 'house']);
+const GENERIC = new Set(['reef', 'reefs', 'riff', 'recif', 'arrecife', 'karang', 'terumbu', 'dive', 'site', 'spot', 'point', 'the', 'el', 'al', 'il', 'la', 'le', 'de', 'del', 'di', 'of', 'north', 'south', 'east', 'west', 'nord', 'sud', 'island', 'isla', 'ile', 'pulau', 'gili', 'wreck', 'house', 'batu', 'tanjung', 'tg', 'cape']);
 const DIRS = { north: 'n', south: 's', east: 'e', west: 'w', nord: 'n', sud: 's', utara: 'n', selatan: 's' };
 function fkey(s) {
-  const words = norm(s).replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w && !GENERIC.has(w));
+  const all = norm(s).replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(Boolean);
+  const kept = all.filter(w => !GENERIC.has(w)); const words = kept.length ? kept : all; // "Batu" alone still matches
   return words.map(w => w.replace(/^sh?a+a?b$|^sheb$/, 'shab').replace(/ph/g, 'f').replace(/ae/g, 'e').replace(/ou/g, 'u').replace(/oo/g, 'u')
     .replace(/kh/g, 'k').replace(/q/g, 'k').replace(/c(?!h)/g, 'k').replace(/z/g, 's').replace(/y/g, 'i').replace(/(.)\1+/g, '$1').replace(/(.)h$/, '$1')).filter(Boolean);
 }
 function trig(s) { const p = ` ${s} `; const out = new Set(); for (let i = 0; i < p.length - 2; i++) out.add(p.slice(i, i + 3)); return out; }
+function lev(a, b) { const m = a.length, n = b.length; let p = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) { const c = [i]; for (let j = 1; j <= n; j++) c[j] = Math.min(p[j] + 1, c[j - 1] + 1, p[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); p = c; } return p[n]; }
+const wsim = (a, b) => Math.max(dice(trig(a), trig(b)), (() => { const L = Math.min(a.length, b.length); if (L < 4) return 0; const e = lev(a, b); return e <= (L >= 8 ? 2 : 1) ? 1 - e / Math.max(a.length, b.length) : 0; })()); // 1 typo, 2 in long words
 function dice(a, b) { if (!a.size || !b.size) return 0; let n = 0; for (const x of a) if (b.has(x)) n++; return 2 * n / (a.size + b.size); }
 function fuzzyScore(q, name) {
   const qa = fkey(q), na = fkey(name); if (!qa.length || !na.length) return 0;
@@ -1462,7 +1466,7 @@ function fuzzyScore(q, name) {
   if (ns === qs) return 1;
   let s = dice(trig(qs), trig(ns));
   // every query word should resemble some name word (handles extra words like "reef" variants and order)
-  const per = qa.map(w => Math.max(...na.map(v => v.startsWith(w) || w.startsWith(v) ? 1 : dice(trig(w), trig(v)))));
+  const per = qa.map(w => Math.max(...na.map(v => v.startsWith(w) || w.startsWith(v) ? 1 : wsim(w, v))));
   s = Math.max(s, per.reduce((a, b) => a + b, 0) / per.length * .95);
   // direction words (north/south) are a tie-breaker, not a filter
   const qd = norm(q).split(/\s+/).map(w => DIRS[w]).filter(Boolean), nd = norm(name).split(/\s+/).map(w => DIRS[w]).filter(Boolean);
@@ -1470,7 +1474,136 @@ function fuzzyScore(q, name) {
   return s;
 }
 
-// Search centre: phone GPS (cached 30 min) or last logged dive with a position.
+/* ---- GPS marks: one tap on the boat; matched later to the dive by time ---- */
+const marks = () => (S.meta.marks = S.meta.marks || []);
+const markSrc = m => m.mode === 'track' ? `Phone location history at ${m.local.slice(11, 16)} (±${m.acc} m)` : `Your GPS mark at ${m.local.slice(11, 16)}, ${m.mode === 'after' ? 'exit point' : 'entry point'} (phone ±${m.acc} m)`;
+const markMode = () => S.meta.markMode || 'after'; // default: marked on the boat after surfacing
+function diveSpan(d) { // [entry, exit] in UTC ms; computer time if known, else wall clock read in the phone time zone
+  const a = d.computer?.startUTC ?? (toMs(d.start) + new Date(toMs(d.start)).getTimezoneOffset() * 6e4);
+  return [a, a + (d.duration || 60) * 6e4];
+}
+// before entry: up to 90 min before entry or 30 min after exit, closest dive wins
+// after surfacing: 5 min before to 60 min after exit, the dive that ended last before the mark wins
+function markGap(m, d) {
+  const [a, b] = diveSpan(d);
+  if (m.mode === 'after') return m.t < b - 5 * 6e4 || m.t > b + 60 * 6e4 ? null : Math.abs(m.t - b);
+  if (m.t < a - 90 * 6e4 || m.t > b + 30 * 6e4) return null; return m.t < a ? a - m.t : m.t > b ? m.t - b : 0;
+}
+// a mark belongs to the dive it is closest to (taken up to 90 min before entry or 30 min after exit)
+function diveMark(d = D) {
+  if (!d?.start) return null;
+  const others = S.dives.filter(x => x.id !== d.id && x.start);
+  let best = null, bg = Infinity;
+  for (const m of marks()) {
+    const g = markGap(m, d); if (g == null) continue;
+    if (others.some(o => { const h = markGap(m, o); return h != null && h < g; })) continue;
+    if (g < bg) { bg = g; best = m; }
+  }
+  return best || trackPos(d);
+}
+
+/* ---- phone location history (Google Maps Timeline export, GPX): no tap needed ----
+   The phone stays on the boat; the boat is at the site when you jump in. */
+const TRACK_WIN = 20 * 6e4;
+const localISO = t => new Date(t - new Date(t).getTimezoneOffset() * 6e4).toISOString().slice(0, 16);
+const track = () => (S.meta.track = S.meta.track || []);
+function trackPos(d) {
+  if (!d?.start || !S.meta.track?.length) return null;
+  const [a, b] = diveSpan(d);
+  let best = null, bs = Infinity;
+  for (const p of S.meta.track) {
+    if (p.t < a - TRACK_WIN || p.t > b + TRACK_WIN || p.acc > 300) continue;
+    const sc = Math.abs(p.t - a) / 6e4 + p.acc / 50; // closest to entry time, then accuracy
+    if (sc < bs) { bs = sc; best = p; }
+  }
+  if (!best) return null;
+  return { id: 'trk' + best.t, t: best.t, lat: best.lat, lon: best.lon, acc: best.acc, mode: 'track', local: new Date(best.t - new Date(best.t).getTimezoneOffset() * 6e4).toISOString().slice(0, 16) };
+}
+// reads Android Timeline.json (semanticSegments, rawSignals), iPhone Timeline export, Takeout Records.json and GPX
+function parseTrack(text) {
+  const out = [];
+  const ll = v => { if (v == null) return null; if (typeof v === 'object') { if (v.latitudeE7 != null) return [v.latitudeE7 / 1e7, v.longitudeE7 / 1e7]; v = v.latLng || v.LatLng || v.point; if (v == null) return null; }
+    const m = String(v).replace(/^geo:/, '').match(/(-?\d+(?:\.\d+)?)\s*°?\s*,\s*(-?\d+(?:\.\d+)?)/); return m ? [+m[1], +m[2]] : null; };
+  const add = (pos, time, acc) => { const t = typeof time === 'number' ? time : Date.parse(time); if (!pos || !isFinite(t) || Math.abs(pos[0]) > 90 || Math.abs(pos[1]) > 180) return; out.push({ t, lat: +pos[0].toFixed(6), lon: +pos[1].toFixed(6), acc: Math.round(acc ?? 50) }); };
+  if (/^\s*</.test(text)) { // GPX
+    const doc = new DOMParser().parseFromString(text, 'application/xml');
+    for (const e of doc.querySelectorAll('trkpt, wpt, rtept')) { const tm = e.querySelector('time'); if (tm) add([+e.getAttribute('lat'), +e.getAttribute('lon')], tm.textContent.trim(), 15); }
+    return out;
+  }
+  const j = JSON.parse(text);
+  const segs = Array.isArray(j) ? j : j.semanticSegments || j.timelineObjects || [];
+  for (const g of segs) {
+    const st = g.startTime || g.duration?.startTimestamp, en = g.endTime || g.duration?.endTimestamp;
+    for (const p of g.timelinePath || []) add(ll(p.point ?? p), p.time || (st && p.durationMinutesOffsetFromStartTime != null ? Date.parse(st) + p.durationMinutesOffsetFromStartTime * 6e4 : null), 30);
+    const v = g.visit?.topCandidate?.placeLocation ?? g.placeVisit?.location; if (v) { const pos = ll(v); add(pos, st, 100); add(pos, en, 100); }
+    const ac = g.activity || g.activitySegment; if (ac) { add(ll(ac.start ?? ac.startLocation), st, 100); add(ll(ac.end ?? ac.endLocation), en, 100); }
+  }
+  for (const r of j.rawSignals || []) if (r.position) add(ll(r.position), r.position.timestamp, r.position.accuracyMeters);
+  for (const r of j.locations || []) add(ll(r), r.timestamp ? r.timestamp : +r.timestampMs, r.accuracy);
+  return out;
+}
+async function importTrack(files) {
+  let pts = [];
+  for (const f of files) { try { pts = pts.concat(parseTrack(await f.text())); } catch (e) { toast(`${f.name}: not a location history or GPX file`); } }
+  const box = $('#trkReport');
+  if (!pts.length) { if (box) box.innerHTML = `<div class="notice warn">${icon('warn')}<div class="small">No positions with a time found in this file.</div></div>`; return; }
+  // keep what can serve: points near logged dives, and the last 14 days for dives not imported yet
+  const spans = S.dives.filter(d => d.start).map(diveSpan), newest = Math.max(...pts.map(p => p.t));
+  const keep = p => p.t > newest - 14 * 864e5 || spans.some(([a, b]) => p.t > a - 3 * 36e5 && p.t < b + 3 * 36e5);
+  const seen = new Set(track().map(p => p.t));
+  for (const p of pts) if (keep(p) && !seen.has(p.t)) { seen.add(p.t); track().push(p); }
+  S.meta.track.sort((a, b) => a.t - b.t); if (S.meta.track.length > 30000) S.meta.track = S.meta.track.slice(-30000);
+  // fill sites that have no position; only report differences on the others
+  const filled = [], differ = [], none = [];
+  for (const d of chrono()) {
+    const st = siteById(d.siteId); const m = diveMark(d); if (!m) { if (st && st.lat == null) none.push(d); continue; }
+    if (!st) continue;
+    if (st.lat == null) { Object.assign(st, { lat: m.lat, lon: m.lon, gpsSource: markSrc(m), gpsVerified: m.acc <= 100 }); if (!st.country) st.country = nearestCountry(m.lat, m.lon); if (!st.region) { const nr = nearRegion(m.lat, m.lon, st.id); if (nr) { st.region = nr.region || ''; st.country = st.country || nr.country || ''; } } filled.push(d); }
+    else { const km = kmBetween(st, m); if (km > 1.5) differ.push([d, km]); }
+    d.mark = { lat: m.lat, lon: m.lon, acc: m.acc, t: m.t, src: m.mode };
+  }
+  await save('meta', 'sites', 'dives');
+  const first = localISO(Math.min(...pts.map(p => p.t))), last = localISO(newest);
+  const nm = d => `#${d.num} ${esc(siteById(d.siteId)?.name || '(site not entered)')}`;
+  if (box) box.innerHTML = `<div class="notice">${icon('check')}<div class="small"><b>${pts.length} positions read (${fmtDay(first)} – ${fmtDay(last)}).</b>
+    ${filled.length ? `<br>Position added: ${filled.map(nm).join(', ')}.` : '<br>No site without a position could be filled.'}
+    ${differ.length ? `<br>Your phone was more than 1.5 km from the saved position on: ${differ.map(([d, km]) => `${nm(d)} (${fmt(km, 1)} km)`).join(', ')}. Open the dive to compare; nothing was changed.` : ''}
+    ${none.length ? `<br>No phone position during: ${none.slice(-6).map(nm).join(', ')}.` : ''}
+    <br>Dives you import later in the next 14 days get their position automatically.</div></div>`;
+  route();
+}
+function takeMark() {
+  if (!navigator.geolocation) { toast('Location is not available on this device'); return; }
+  toast('Getting a GPS fix…'); const hideToast = () => $$('.toast').forEach(x => x.remove());
+  let best = null, done = false, w = null, tm = null; const t0 = Date.now();
+  const stop = () => { done = true; if (w != null) navigator.geolocation.clearWatch(w); clearTimeout(tm); };
+  const finish = () => {
+    if (done) return; stop(); hideToast();
+    if (!best) { toast('No GPS fix. Try again with a clear view of the sky'); return; }
+    const p = best, now = Date.now();
+    const m = { id: uid('m'), t: now, local: new Date(now - new Date().getTimezoneOffset() * 6e4).toISOString().slice(0, 16), lat: +p.coords.latitude.toFixed(6), lon: +p.coords.longitude.toFixed(6), acc: Math.round(p.coords.accuracy), mode: markMode() };
+    marks().push(m); save('meta');
+    openMarks(m);
+  };
+  // watch up to 25 s and keep the most accurate fix; stop early once it is within 25 m
+  w = navigator.geolocation.watchPosition(p => { if (!best || p.coords.accuracy < best.coords.accuracy) best = p; if (p.coords.accuracy <= 25 || Date.now() - t0 > 25000) finish(); },
+    err => { if (err.code === 1 && !done) { stop(); toast('Location permission denied'); } }, { enableHighAccuracy: true, maximumAge: 0, timeout: 25000 });
+  tm = setTimeout(finish, 26000);
+}
+function openMarks(fresh) {
+  const ms = marks().slice().sort((a, b) => b.t - a.t).slice(0, 20);
+  const owner = m => S.dives.find(d => diveMark(d) === m);
+  sheet(fresh ? 'Site marked' : 'GPS marks', `
+    ${fresh ? `<div class="notice">${icon('check')}<div class="small"><b class="num">${fresh.lat.toFixed(5)}, ${fresh.lon.toFixed(5)}</b> · ±${fresh.acc} m · ${fresh.local.slice(11, 16)}<br>${fresh.mode === 'after' ? 'The dive you just finished gets this position as its exit point, once you log or import it. Mark within 60 min of surfacing, before the boat moves on.' : 'The dive you are about to do gets this position as its entry point, once you log or import it.'}</div></div>` : `<div class="small">One tap on the boat saves the phone's GPS position. The dive logged or imported for that time then gets it automatically, even if no database knows the site.</div>`}
+    <div class="stack" style="gap:6px"><div class="small"><b>I mark the site</b></div><div class="seg" id="markModeSeg">${[['after', 'After surfacing'], ['before', 'Before entry']].map(([v, l]) => `<button type="button" data-v="${v}" aria-pressed="${markMode() === v}">${l}</button>`).join('')}</div>
+      <div class="hint">${markMode() === 'after' ? 'Exit point: on drift dives it can be 1–2 km from the entry. Up to 60 min after surfacing.' : 'Entry point: up to 90 min before entry.'}</div></div>
+    <div class="row wrap"><button class="btn primary" data-act="mark">${icon('gps')}${fresh ? 'Mark again' : 'Mark site now'}</button></div>
+    <div class="hint">Shortcut: long-press the Dive Log icon on your home screen and choose “Mark dive site”.</div>
+    <div class="panel stack"><h3>Recent marks</h3>${ms.length ? ms.map(m => { const d = owner(m), st = d && siteById(d.siteId);
+      return `<div class="row"><div class="grow small"><b class="num">${fmtDate(m.local)}</b> · ±${m.acc} m · ${m.mode === 'after' ? 'exit' : 'entry'}<br><span class="muted">${d ? `Dive #${d.num ?? ''} ${esc(st?.name || '(site not entered)')}` : 'No dive logged for this time yet'}</span></div><button class="iconbtn" data-act="mark-del" data-id="${m.id}" aria-label="Delete mark">${icon('close')}</button></div>`; }).join('') : '<div class="small muted">None yet.</div>'}</div>`);
+  $('#markModeSeg')?.addEventListener('click', async e => { const b = e.target.closest('button'); if (!b) return; S.meta.markMode = b.dataset.v; const f = fresh && marks().find(x => x.id === fresh.id); if (f) f.mode = b.dataset.v; await save('meta'); openMarks(f || null); });
+}
+// Search centre: the dive's GPS mark, phone GPS (cached 30 min) or last logged dive with a position.
 const Centre = {
   fix: null,
   load() { try { const f = JSON.parse(localStorage.getItem('lastFix') || 'null'); if (f && Date.now() - f.t < 30 * 6e4) this.fix = f; } catch (e) { } },
@@ -1482,6 +1615,8 @@ const Centre = {
     });
   },
   get() {
+    const mk = typeof D !== 'undefined' && D && $('#dform') ? diveMark() : null;
+    if (mk) return { lat: mk.lat, lon: mk.lon, label: `your GPS mark (${mk.local.slice(11, 16)})` };
     if (this.fix && Date.now() - this.fix.t < 30 * 6e4) return { lat: this.fix.lat, lon: this.fix.lon, label: 'your position' };
     const last = chrono().filter(d => siteById(d.siteId)?.lat != null).pop();
     if (last) { const s = siteById(last.siteId); return { lat: s.lat, lon: s.lon, label: `your last dive (${s.name})` }; }
@@ -1491,27 +1626,32 @@ const Centre = {
 
 // Offline pack: every mapped dive site, reef and named wreck within RADIUS km, from OpenStreetMap.
 const RADIUS = 150;
+const PACK_V = 2; // v2 adds small islands, islets, capes and rocks
 const Pack = {
   data: null, busy: null,
   async load() { this.data = (await DB.get('sitepack')) || null; },
-  covers(c) { return this.data && c && kmBetween(this.data.centre, c) <= RADIUS * .4 && Date.now() - this.data.at < 30 * 864e5; },
+  covers(c) { return this.data && this.data.v === PACK_V && c && kmBetween(this.data.centre, c) <= RADIUS * .4 && Date.now() - this.data.at < 30 * 864e5; },
   async ensure(c, force) {
     if (!c || !navigator.onLine || (!force && this.covers(c))) return this.data;
     if (this.busy) return this.busy;
     this.busy = (async () => {
       const dLat = RADIUS / 111, dLon = RADIUS / (111 * Math.max(.2, Math.cos(c.lat * Math.PI / 180)));
       const b = [c.lat - dLat, c.lon - dLon, c.lat + dLat, c.lon + dLon].map(v => v.toFixed(3)).join(',');
-      const ql = `[out:json][timeout:60];(nwr["sport"="scuba_diving"][!"shop"][!"amenity"][!"tourism"](${b});nwr["scuba_diving:divespot"](${b});nwr["natural"="reef"]["name"](${b});nwr["historic"="wreck"]["name"](${b});nwr["seamark:type"="wreck"]["name"](${b}););out center tags qt;`;
+      const ql = `[out:json][timeout:60];(nwr["sport"="scuba_diving"][!"shop"][!"amenity"][!"tourism"](${b});nwr["scuba_diving:divespot"](${b});nwr["natural"="reef"]["name"](${b});nwr["historic"="wreck"]["name"](${b});nwr["seamark:type"="wreck"]["name"](${b});nwr["natural"~"^(island|islet|cape|rock|reef)$"]["name"](${b});nwr["place"~"^(island|islet)$"]["name"](${b}););out bb tags qt;`;
       const j = await fetchJSON('https://overpass-api.de/api/interpreter', { method: 'POST', body: 'data=' + encodeURIComponent(ql), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }, 70000);
       const items = []; const seen = new Set();
       for (const e of j.elements) {
-        const t = e.tags || {}; const lat = e.lat ?? e.center?.lat, lon = e.lon ?? e.center?.lon; const name = t.name || t['name:en']; if (!name || lat == null) continue;
+        const t = e.tags || {}; const bb = e.bounds; const lat = e.lat ?? (bb && (bb.minlat + bb.maxlat) / 2), lon = e.lon ?? (bb && (bb.minlon + bb.maxlon) / 2); const name = t.name || t['name:en']; if (!name || lat == null) continue;
         if (kmBetween(c, { lat, lon }) > RADIUS) continue;
         const k = norm(name) + Math.round(lat * 200) + ',' + Math.round(lon * 200); if (seen.has(k)) continue; seen.add(k);
-        const kind = t.historic === 'wreck' || t['seamark:type'] === 'wreck' ? 'wreck' : t.natural === 'reef' ? 'reef' : 'dive site';
+        const dive = t.sport === 'scuba_diving' || t['scuba_diving:divespot'];
+        const kind = t.historic === 'wreck' || t['seamark:type'] === 'wreck' ? 'wreck' : t.natural === 'reef' ? 'reef' : dive ? 'dive site' : t.natural === 'cape' ? 'cape' : t.natural === 'rock' ? 'rock' : (t.place || t.natural);
+        if (!['wreck', 'reef', 'dive site'].includes(kind)) { // geographic feature: keep only small ones, its centre is near any reef around it
+          if (bb && kmBetween({ lat: bb.minlat, lon: bb.minlon }, { lat: bb.maxlat, lon: bb.maxlon }) > 4) continue;
+        }
         items.push({ name, alt: [t['name:en'], t.alt_name, t.old_name, t.int_name, t['name:ar']].filter(Boolean).join(';'), lat: +lat.toFixed(6), lon: +lon.toFixed(6), kind, depth: t.depth || t.maxdepth || t['scuba_diving:maxdepth'] || '' });
       }
-      this.data = { centre: { lat: c.lat, lon: c.lon }, label: c.label, at: Date.now(), items };
+      this.data = { v: PACK_V, centre: { lat: c.lat, lon: c.lon }, label: c.label, at: Date.now(), items };
       await DB.set('sitepack', this.data); return this.data;
     })();
     try { return await this.busy; } finally { this.busy = null; }
@@ -1527,7 +1667,8 @@ const Lookup = {
   pack(q, c) {
     if (!Pack.data) return [];
     return Pack.data.items.map(it => ({ it, score: Math.max(fuzzyScore(q, it.name), ...(it.alt ? it.alt.split(';').map(a => fuzzyScore(q, a)) : [0])) })).filter(x => x.score >= .5)
-      .map(({ it, score }) => ({ kind: 'osm', name: it.name, lat: it.lat, lon: it.lon, src: `OpenStreetMap ${it.kind}`, detail: it.depth ? `depth ${it.depth}${/^[\d.]+$/.test(it.depth) ? ' m' : ''}` : '', score, km: c ? kmBetween(c, it) : null }))
+      .map(({ it, score }) => { const geo = !['wreck', 'reef', 'dive site'].includes(it.kind);
+        return { kind: geo ? 'geo' : 'osm', name: it.name, lat: it.lat, lon: it.lon, src: geo ? `OpenStreetMap ${it.kind} · approximate, not the dive site` : `OpenStreetMap ${it.kind}`, detail: it.depth ? `depth ${it.depth}${/^[\d.]+$/.test(it.depth) ? ' m' : ''}` : '', score: geo ? score * .9 : score, km: c ? kmBetween(c, it) : null }; })
       .sort((a, b) => b.score - a.score || (a.km ?? 1e9) - (b.km ?? 1e9)).slice(0, 8);
   },
   async wiki(q, c, wide) { // only articles about reefs, wrecks or dive sites, inside the area unless wide
@@ -1557,6 +1698,7 @@ function dedupe(list) {
 /* ================= router & shell ================= */
 const VIEWS = { log: renderLog, stats: renderStats, certs: renderCerts, sign: renderSign };
 function route() {
+  if (location.hash === '#mark') { history.replaceState(null, '', '#log'); route(); setTimeout(takeMark, 300); return; }
   const v = (location.hash || '#log').slice(1);
   const view = VIEWS[v] ? v : 'log';
   $$('nav.tabs a[data-v]').forEach(a => a.setAttribute('aria-current', a.dataset.v === view ? 'page' : 'false'));
@@ -1567,6 +1709,7 @@ function route() {
 function shell(title, sub, body, actions = '') {
   $('#main').innerHTML = `<header class="topbar"><div class="grow"><h1>${title}</h1>${sub ? `<div class="sub">${sub}</div>` : ''}</div>${actions}
     <button class="iconbtn" data-act="import" aria-label="Import dives from computer">${icon('download')}</button><button class="iconbtn" data-act="more" aria-label="Backup and settings">${icon('more')}</button></header><div class="view">${body}</div>`;
+  if (title === 'Logbook') $('header.topbar .grow').insertAdjacentHTML('afterend', `<button class="iconbtn" data-act="marks" aria-label="Mark dive site with GPS">${icon('gps')}</button>`);
 }
 
 /* ================= LOG ================= */
@@ -1921,12 +2064,12 @@ let suggCache = [];
 function renderSugg(q, st) {
   const box = $('#siteSugg'); if (!box) return;
   suggCache = st.list.slice(0, 10);
-  const li = (r, i) => `<button type="button" data-act="pick-site" data-i="${i}">${icon(r.kind === 'mine' ? 'log' : r.kind === 'wiki' ? 'globe' : /wreck/.test(r.src) ? 't_wreck' : /reef/.test(r.src) ? 't_reef' : 'pin')}
+  const li = (r, i) => `<button type="button" data-act="pick-site" data-i="${i}">${icon(r.kind === 'mine' ? 'log' : r.kind === 'wiki' || r.kind === 'geo' ? 'globe' : /wreck/.test(r.src) ? 't_wreck' : /reef/.test(r.src) ? 't_reef' : 'pin')}
     <div style="min-width:0"><div style="font-weight:600">${esc(r.name)}</div><div class="src">${esc(r.src)}</div>${r.detail ? `<div class="small muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.detail)}</div>` : ''}</div>
     <div class="d">${r.km != null ? fmt(r.km, 0) + ' km' : r.country ? esc(r.country) : ''}</div></button>`;
   let html = suggCache.length ? `<div class="sugg">${suggCache.map(li).join('')}</div>` : '';
   const area = siteWide ? 'worldwide' : st.c ? `within ${RADIUS} km of ${esc(st.c.label)}` : 'without a position (allow location, or log a dive with GPS)';
-  const pk = Pack.data ? ` Offline pack: ${Pack.data.items.length} dive sites.` : '';
+  const pk = Pack.data ? ` Offline pack: ${Pack.data.items.length} places.` : '';
   const status = st.loading ? `Searching dive sites ${area}…`
     : st.offline ? `Offline: your log and the offline pack were searched ${area}.${pk}`
       : st.failed ? `Online search unavailable (no connection, or blocked in this preview). Your log${Pack.data ? ' and the offline pack' : ''} were searched.`
@@ -1940,7 +2083,8 @@ function renderSugg(q, st) {
 async function pickSite(r) {
   if (r.siteId) { Dmeta.site = clone(siteById(r.siteId)); D.siteId = r.siteId; }
   else {
-    Dmeta.site = { id: uid('s'), name: $('#siteName').value.trim() || r.name, lat: r.lat, lon: r.lon, gpsSource: r.src, gpsVerified: false, country: r.country || '', region: r.region || '', notes: r.detail || '', url: r.url || '' };
+    const mk = r.kind === 'geo' ? diveMark() : null; // a GPS mark beats an island centre
+    Dmeta.site = { id: uid('s'), name: $('#siteName').value.trim() || r.name, lat: mk ? mk.lat : r.lat, lon: mk ? mk.lon : r.lon, gpsSource: mk ? markSrc(mk) : r.kind === 'geo' ? `Centre of ${r.name} (${r.src.replace('OpenStreetMap ', '').split(' ·')[0]}), approximate` : r.src, gpsVerified: !!mk, country: r.country || '', region: r.region || '', notes: r.detail || '', url: r.url || '' };
     if (!Dmeta.site.country) Dmeta.site.country = nearestCountry(r.lat, r.lon);
     D.siteId = Dmeta.site.id;
   }
@@ -1952,7 +2096,8 @@ async function pickSite(r) {
 function newSite() {
   const name = $('#siteName').value.trim(); if (!name) return;
   Dmeta.site = { id: uid('s'), name, lat: null, lon: null, gpsSource: '', gpsVerified: false, country: '', region: '', notes: '' };
-  D.siteId = Dmeta.site.id; $('#siteSugg').innerHTML = ''; drawSiteCard();
+  D.siteId = Dmeta.site.id; $('#siteSugg').innerHTML = '';
+  const m = diveMark(); if (m) { setSiteCoords(m.lat, m.lon, markSrc(m), true); toast('Position set from your GPS mark'); } else drawSiteCard();
 }
 function siteHistory(siteId) {
   const ds = S.dives.filter(d => d.siteId === siteId && d.id !== D?.id); if (!ds.length) return '';
@@ -1978,13 +2123,17 @@ function drawSiteCard() {
       ${has && !s.gpsVerified ? `<button type="button" class="btn small" data-act="verify-gps">${icon('check')}Position is correct</button>` : ''}
       ${near.length ? `<details class="small"><summary>Same place as another site? Merge</summary><div class="row" style="margin-top:6px"><select id="mergeSel" aria-label="Merge into">${near.map(x => `<option value="${x.o.id}">${esc(x.o.name)}${x.km != null ? ` · ${fmt(x.km, 1)} km` : ''}</option>`).join('')}</select><button type="button" class="btn small" data-act="merge-ask">Merge</button></div><div id="mergeZone"></div></details>` : ''}
     </div></div>
+    ${(() => { const m = diveMark(); if (!m) return ''; const km = has ? kmBetween(s, m) : null;
+      if (has && (km < 1 || s.gpsSource === markSrc(m))) return '';
+      return `<div class="notice">${icon('gps')}<div class="small grow">${has ? `Your GPS mark at ${m.local.slice(11, 16)} is <b>${fmt(km, 1)} km</b> from this site's position.` : `You marked a position at ${m.local.slice(11, 16)} (${m.mode === 'after' ? 'exit point, ' : ''}±${m.acc} m).`}
+        <div style="margin-top:6px"><button type="button" class="btn small water" data-act="use-mark">Use my mark as the site position</button></div></div></div>`; })()}
     <div class="fallback panel"><h3>${has ? 'Change position' : 'Find the GPS position'}</h3>
       <div class="row wrap"><button type="button" class="btn small water" data-act="gps-now">${icon('gps')}Use my position now</button><button type="button" class="btn small" data-act="pick-map">${icon('pin')}Pick on map</button></div>
       <div class="row"><input type="text" id="coordIn" placeholder="Paste 24.92, 35.86 · 24°55′N 35°51′E · Maps link" aria-label="Paste coordinates"><button type="button" class="btn small" data-act="coord-apply">Set</button></div>
-      ${has ? '' : `<ol class="small"><li>On the boat at the site: tap <b>Use my position now</b>. Best accuracy.</li>
+      ${has ? '' : `<ol class="small"><li>Next time, on the boat after surfacing: tap the GPS button at the top of the Logbook, or long-press the app icon → <b>Mark dive site</b>. The position is then filled in for you.</li><li>Still on the boat now: <b>Use my position now</b>.</li>
         <li>Ask the guide or check the dive computer: Garmin, Shearwater and Suunto GPS models store the entry point.</li>
         <li><a target="_blank" rel="noopener" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(s.name + ' dive site' + (s.region ? ' ' + s.region : ''))}">Search Google Maps</a>, long-press the reef to drop a pin, copy the coordinates and paste them above.</li>
-        <li><a target="_blank" rel="noopener" href="https://www.google.com/search?q=${encodeURIComponent(s.name + ' dive site site:padi.com OR site:divessi.com OR site:wannadive.net')}">Search PADI, SSI and Wannadive pages</a>; many list coordinates or a map.</li></ol>`}
+        <li><a target="_blank" rel="noopener" href="https://www.google.com/search?q=${encodeURIComponent(s.name + ' dive site site:padi.com OR site:divessi.com OR site:wannadive.net')}">Search PADI, SSI and Wannadive pages</a>. They rarely give coordinates, but they say which island the site is at; pin that spot on Google Maps.</li></ol>`}
     </div>`;
   $('#siteCountry').addEventListener('input', e => s.country = e.target.value);
   const rn = $('#siteRename'); if (rn) rn.addEventListener('input', e => { s.name = e.target.value; $('#siteName').value = s.name; });
@@ -2030,6 +2179,7 @@ async function saveDive() {
       applyComputer(D, c, stub); D.id = stub.id; D.num = stub.num; S.dives = S.dives.filter(x => x.id !== stub.id); merged = true;
     }
   }
+  { const m = diveMark(); if (m) D.mark = { lat: m.lat, lon: m.lon, acc: m.acc, t: m.t }; }
   const j = S.dives.findIndex(x => x.id === D.id); if (j >= 0) S.dives[j] = D; else S.dives.push(D);
   await save('dives', 'sites', 'gear');
   closeSheet(); toast(merged ? `Dive #${D.num} saved and merged with computer data` : Dmeta.isNew ? `Dive #${D.num} saved` : 'Changes saved'); route();
@@ -2089,13 +2239,19 @@ function matchDive(c) {
   return best?.d || null;
 }
 function openImport() {
-  sheet('Import from dive computer', `
+  sheet('Import dives and positions', `
     <div class="panel stack"><h3>1 · Export from the Suunto app</h3><ol class="small" style="margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px">
       <li>Sync the EON Steel Black with the Suunto app.</li><li>Open the dive in the app (diary / calendar).</li><li>Tap ⋮ (top right), then the FIT export or download option.</li><li>The file lands in your phone's Downloads folder. Repeat for each dive.</li></ol></div>
     <div class="panel stack"><h3>2 · Pick the files</h3><div class="small">Select one or many .fit files, in any order. Each file is matched to a logged dive by its start time. Unmatched dives are added and wait for you to enter the site and other details.</div>
       <label class="btn primary" style="cursor:pointer">${icon('upload')}Choose .fit files<input type="file" id="fitIn" accept=".fit,application/octet-stream,application/vnd.ant.fit" multiple hidden></label></div>
-    <div id="fitReport" class="stack"></div>`);
+    <div id="fitReport" class="stack"></div>
+    <div class="panel stack"><h3>3 · Site positions from your phone (optional)</h3>
+      <div class="small">No tapping needed. If Google Maps Timeline is on, your phone records where it was while it sat on the boat. Each dive takes the phone's position at entry time (±20 min). Sites that already have a position are not changed.</div>
+      <ol class="small" style="margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px"><li>Android: Settings → Location → Location services → Timeline → <b>Export Timeline data</b>. Save the file.</li><li>Or a .gpx file from any GPS logger app running on the boat.</li></ol>
+      <label class="btn" style="cursor:pointer">${icon('upload')}Choose Timeline .json or .gpx<input type="file" id="trkIn" accept=".json,.gpx,application/json,application/gpx+xml,text/xml" multiple hidden></label>
+      ${S.meta.track?.length ? `<div class="hint">${S.meta.track.length} positions stored, ${fmtDay(localISO(S.meta.track[0].t))} – ${fmtDay(localISO(S.meta.track.at(-1).t))}.</div>` : ''}<div id="trkReport"></div></div>`);
   $('#fitIn').addEventListener('change', e => importFitFiles([...e.target.files]));
+  $('#trkIn').addEventListener('change', e => importTrack([...e.target.files]));
 }
 async function importFitFiles(files) {
   const rep = []; const lastNum = Math.max(0, ...S.dives.map(d => d.num || 0)); const lastStart = chrono().pop()?.start || '';
@@ -2509,7 +2665,7 @@ function openMore() {
       <div id="impZone"></div>
       <div class="row wrap"><button class="btn small" data-act="export-csv">${icon('download')}Dives as CSV (Excel)</button><button class="btn small" data-act="print">${icon('log')}Print / save logbook PDF</button></div>
       <div class="hint">Full backup includes signatures, stamps and certification scans. Save it to Google Drive after each trip.</div></div>
-    <div class="panel stack"><h3>Offline dive-site search</h3><div class="small">${Pack.data ? `${Pack.data.items.length} dive sites, reefs and wrecks within ${RADIUS} km of ${esc(Pack.data.label || 'the saved area')}, downloaded ${fmtDay(new Date(Pack.data.at).toISOString())}.` : 'Not downloaded yet. It downloads automatically when you have internet and a position.'} Source: OpenStreetMap.</div>
+    <div class="panel stack"><h3>Offline dive-site search</h3><div class="small">${Pack.data ? `${Pack.data.items.length} dive sites, reefs, wrecks, islets and capes within ${RADIUS} km of ${esc(Pack.data.label || 'the saved area')}, downloaded ${fmtDay(new Date(Pack.data.at).toISOString())}.` : 'Not downloaded yet. It downloads automatically when you have internet and a position.'} Source: OpenStreetMap.</div>
       <button class="btn small" data-act="pack-refresh">${icon('download')}Download for my current area</button></div>
     <div class="panel stack"><h3>Appearance</h3><div class="seg" id="themeSeg">${[['system', 'System'], ['light', 'Light'], ['dark', 'Dark']].map(([v, l]) => `<button type="button" data-v="${v}" aria-pressed="${theme === v}">${l}</button>`).join('')}</div></div>
     <div class="panel stack"><h3>My equipment</h3><div class="hint">Only items you own. Rented gear is logged per dive with model and size. Set a service interval to get a reminder; leave it empty for no reminder.</div>
@@ -2587,6 +2743,10 @@ document.addEventListener('click', async e => {
     case 'save-dive': saveDive(); break;
     case 'pick-site': pickSite(suggCache[+b.dataset.i]); break;
     case 'new-site': newSite(); break;
+    case 'marks': openMarks(); break;
+    case 'mark': closeSheet(); takeMark(); break;
+    case 'mark-del': S.meta.marks = marks().filter(m => m.id !== id); await save('meta'); openMarks(); break;
+    case 'use-mark': { const m = diveMark(); if (m) { setSiteCoords(m.lat, m.lon, markSrc(m), true); toast('Position set from your mark'); } break; }
     case 'gps-now':
       if (!navigator.geolocation) { toast('Location is not available here'); break; }
       b.disabled = true; b.lastChild.textContent = 'Locating…';
@@ -2598,7 +2758,7 @@ document.addEventListener('click', async e => {
     case 'verify-gps': Dmeta.site.gpsVerified = true; drawSiteCard(); break;
     case 'import': openImport(); break;
     case 'search-wide': siteWide = true; siteSeq++; searchSites($('#siteName').value.trim(), siteSeq); break;
-    case 'pack-refresh': { b.disabled = true; const c = (await Centre.ask(), Centre.get()); try { await Pack.ensure(c, true); toast(`${Pack.data.items.length} dive sites saved for offline search`); } catch (e) { toast('Could not download: check the connection'); } openMore(); break; }
+    case 'pack-refresh': { b.disabled = true; const c = (await Centre.ask(), Centre.get()); try { await Pack.ensure(c, true); toast(`${Pack.data.items.length} places saved for offline search`); } catch (e) { toast('Could not download: check the connection'); } openMore(); break; }
     case 'rename-instead': { const nm = Dmeta.site.name; const coords = Dmeta.site.lat != null ? { lat: Dmeta.site.lat, lon: Dmeta.site.lon, gpsSource: Dmeta.site.gpsSource, gpsVerified: Dmeta.site.gpsVerified } : {};
       Dmeta.site = { ...Dmeta.prevSite, name: nm, ...coords }; D.siteId = Dmeta.site.id; Dmeta.prevSite = null; $('#siteName').value = nm; drawSiteCard(); drawSun(); break; }
     case 'merge-ask': { const t = siteById($('#mergeSel').value); const n2 = S.dives.filter(d => d.siteId === Dmeta.site.id).length;
