@@ -20,20 +20,5 @@
    "type": "image/png",
    "purpose": "any maskable"
   }
- ],
- "shortcuts": [
-  {
-   "name": "Mark dive site",
-   "short_name": "Mark site",
-   "description": "Save the phone's GPS position for the dive you are about to do",
-   "url": "./#mark",
-   "icons": [
-    {
-     "src": "icon-192.png",
-     "sizes": "192x192",
-     "type": "image/png"
-    }
-   ]
-  }
  ]
 }
