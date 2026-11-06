@@ -1249,6 +1249,19 @@ const siteById = id => S.sites.find(s => s.id === id);
 const diveById = id => S.dives.find(d => d.id === id);
 const signerById = id => S.signers.find(s => s.id === id);
 const fingerprint = d => [d.start, d.siteId, d.maxDepth, d.duration].join('|');
+// people names: first letter of each word in capitals, the rest as typed ("anna" → "Anna", "McDonald" kept)
+const capName = s => String(s || '').trim().replace(/\s+/g, ' ').replace(/(^|[\s\-(])(\p{Ll})/gu, (m, a, b) => a + b.toUpperCase());
+const capList = arr => { const m = new Map(); for (const n of arr || []) { const v = capName(n); if (v && !m.has(norm(v))) m.set(norm(v), v); } return [...m.values()]; };
+// what changed on a signed dive since it was signed (date/time, site, depth, bottom time); empty if nothing
+function sigEdits(sg, d) {
+  const fp = sg.fp && sg.fp[d.id]; if (!fp || !sigChanged(sg, d)) return [];
+  const [start, site, depth, dur] = fp.split('|'), out = [];
+  if (start !== String(d.start)) out.push(`time ${start.replace('T', ' ')} → ${String(d.start).replace('T', ' ')}`);
+  if (site !== String(d.siteId) && !(siteById(d.siteId)?.aliases || []).includes(site)) out.push(`site ${siteById(site)?.name || 'another site'} → ${siteById(d.siteId)?.name || 'none'}`);
+  if (depth !== String(d.maxDepth)) out.push(`max depth ${depth} → ${d.maxDepth} m`);
+  if (dur !== String(d.duration)) out.push(`bottom time ${dur} → ${d.duration} min`);
+  return out;
+}
 const chrono = () => [...S.dives].sort((a, b) => a.start.localeCompare(b.start));
 const sigsFor = d => S.signatures.filter(s => s.diveIds.includes(d.id));
 const isSigned = d => sigsFor(d).length > 0;
@@ -1353,6 +1366,23 @@ function repairData() {
     w.forEach(st => { st.gpsVerified = false; });
     if (w.length) notes.push(`Marked “to check”: ${w.map(st => st.name).join(', ')} (position from a phone Wi-Fi fix, ±50 m or worse).`);
     S.meta.fixes.push('wifi-verified-2026-11-06');
+  }
+  // f) v16: a PADI number in the guide field becomes the person's name when a saved signer or a certification card names it;
+  //    guide and buddy names get capitals; a signature record named only by that number takes the name too
+  if (!S.meta.fixes.includes('people-2026-11-06')) {
+    const byNo = new Map();
+    for (const g of S.signers) if (g.number && !/\d/.test(g.name || '')) byNo.set(String(g.number).replace(/\D/g, ''), g.name);
+    for (const c of S.certs) if (c.instructor && c.instructorNo) { const k = String(c.instructorNo).replace(/\D/g, ''); if (k.length >= 4 && !byNo.has(k)) byNo.set(k, c.instructor); }
+    const named = {}; let caps = 0;
+    for (const d of S.dives) {
+      for (const [no, nm] of byNo) if (d.guide && new RegExp(`(^|\\D)${no}(\\D|$)`).test(d.guide) && d.guide !== nm) { (named[`${d.guide} → ${nm}`] ||= []).push(d.num); d.guide = nm; }
+      const g = capName(d.guide), b = capList(d.buddies); if ((d.guide || '') !== g || JSON.stringify(d.buddies || []) !== JSON.stringify(b)) { d.guide = g; d.buddies = b; caps++; }
+    }
+    let sigN = 0; for (const sg of S.signatures) { const k = String(sg.number || '').replace(/\D/g, ''); if (byNo.has(k) && /\d/.test(sg.name || '')) { notes.push(`Signature record “${sg.name}” named ${byNo.get(k)} (same PADI number).`); sg.name = byNo.get(k); sigN++; } }
+    for (const [t, nums] of Object.entries(named)) notes.push(`Guide “${t.split(' → ')[0]}” → ${t.split(' → ')[1]} on ${nums.length} dive${nums.length > 1 ? 's' : ''} (PADI number matches a saved signer or a certification card).`);
+    if (caps) notes.push(`Capital first letters in guide and buddy names on ${caps} dive${caps > 1 ? 's' : ''}.`);
+    if (sigN) save('signatures');
+    S.meta.fixes.push('people-2026-11-06');
   }
   // e) v15: boat mode and tap marks removed; tap marks become ordinary GPS track points, boat mode session logs are dropped
   if (!S.meta.fixes.includes('no-boat-mode-2026-11-06')) {
@@ -1845,7 +1875,7 @@ function diveRow(d) {
     <div style="min-width:0"><div class="site">${s.name ? esc(s.name) : '<span style="color:var(--warn)">Site not entered</span>'}</div>
       <div class="when">${fmtDate(d.start)}${d.operator ? ' · ' + esc(d.operator) : ''}</div>
       ${d.life?.length ? `<div class="life" aria-label="Marine life">${d.life.slice(0, 7).map(l => icon(lifeIcon(l.sp))).join('')}</div>` : ''}
-      <div class="flags">${sig.length ? `<span class="badge ${changed ? 'warn' : 'ok'}">${icon(changed ? 'warn' : 'shield')}${changed ? 'Changed after signing' : 'Signed'}</span>` : ''}
+      <div class="flags">${sig.length ? `<span class="badge ok">${icon('shield')}Signed${changed ? ' · edited' : ''}</span>` : ''}
         ${d.computer ? `<span class="badge">${icon('t_deep')}Computer</span>` : ''}
         ${!d.siteId ? (diveMark(d) ? `<span class="badge accent">${icon('gps')}Site to confirm</span>` : '') : s.lat == null ? `<span class="badge warn">${icon('pin')}No GPS</span>` : (() => { const pd = posDiff(d); return pd ? `<span class="badge warn">${icon('gps')}Phone ${fmt(pd.km, 1)} km away</span>` : !s.gpsVerified ? `<span class="badge">${icon('pin')}GPS to check</span>` : ''; })()}
         ${(d.types || []).includes('night') ? `<span class="badge">${icon('t_night')}Night</span>` : ''}</div>
@@ -1865,7 +1895,9 @@ function drawLogList() {
       ${ds.slice().reverse().map(diveRow).join('')}</section>`;
   }
   el.innerHTML = html || `<div class="empty">No dives match “${esc(logQuery)}”.</div>`;
+  LOGORDER = $$('[data-act=open]', el).map(b => b.dataset.id);
 }
+let LOGORDER = [];
 
 /* ================= SHEETS ================= */
 function sheet(title, body, foot = '', opts = {}) {
@@ -1933,7 +1965,16 @@ function openDive(id) {
     <div class="panel stack"><h3>Verification</h3>${sigs.length ? sigs.map(g => sigBlock(g, d)).join('') : `<div class="muted">Not signed yet.</div>`}
       <button class="btn" data-act="sign-dive" data-id="${d.id}">${icon('pen')}Get this dive signed</button></div>
     <div id="delzone"><button class="btn danger" data-act="ask-del" data-id="${d.id}">${icon('trash')}Delete dive</button></div>`;
-  sheet(`Dive #${d.num}`, body, `<button class="btn" data-act="dup" data-id="${d.id}">${icon('copy')}Next dive here</button><button class="btn primary" data-act="edit" data-id="${d.id}">${icon('edit')}Edit</button>`);
+  // neighbours: the log as shown (search and year filter included), newest first; else all dives
+  const order = LOGORDER.includes(d.id) ? LOGORDER : chrono().reverse().map(x => x.id), oi = order.indexOf(d.id);
+  const newer = order[oi - 1], older = order[oi + 1];
+  const nav = (to, lbl, ch) => `<button class="iconbtn" data-act="dive-nav" data-id="${to || ''}" aria-label="${lbl}" ${to ? '' : 'disabled style="opacity:.3"'}><span style="font-size:22px;line-height:1">${ch}</span></button>`;
+  sheet(`Dive #${d.num}`, body, `<button class="btn" data-act="dup" data-id="${d.id}">${icon('copy')}Next dive here</button><button class="btn primary" data-act="edit" data-id="${d.id}">${icon('edit')}Edit</button>`, { actions: `${nav(newer, 'Newer dive', '‹')}${nav(older, 'Older dive', '›')}` });
+  // swipe left = older (next in the log), right = newer; not from the screen edges (Android back gesture)
+  const sb = $('#sheet .sheet-b'); let sx = null, sy = 0;
+  sb.addEventListener('touchstart', e => { const t = e.touches[0]; sx = e.touches.length > 1 || t.clientX < 24 || t.clientX > innerWidth - 24 || e.target.closest('input, textarea, select, canvas, .chips') ? null : t.clientX; sy = t.clientY; }, { passive: true });
+  sb.addEventListener('touchend', e => { if (sx == null) return; const t = e.changedTouches[0], dx = t.clientX - sx, dy = t.clientY - sy; sx = null;
+    if (Math.abs(dx) >= 60 && Math.abs(dx) > 1.5 * Math.abs(dy)) { const to = dx < 0 ? older : newer; if (to) openDive(to); } }, { passive: true });
 }
 function sigBlock(g, d) {
   const sg = g.signerId ? signerById(g.signerId) : null;
@@ -1944,7 +1985,7 @@ function sigBlock(g, d) {
     <div><b>${esc(g.name)}</b> <span class="muted">· ${esc(g.role)} ${esc(g.agency)} ${esc(g.number)}</span></div>
     <div class="small muted">${g.method === 'imported' ? 'Imported' : g.method === 'drawn' ? 'Signed on device' : 'Signature image'} · ${fmtDay(g.signedAt)} · covers ${g.diveIds.length} dive${g.diveIds.length > 1 ? 's' : ''}</div>
     ${g.note ? `<div class="small">${esc(g.note)}</div>` : ''}
-    ${changed ? `<div class="notice warn">${icon('warn')}<div>Date, site, depth or time changed after this signature. Ask for a new signature.</div></div>` : ''}</div>`;
+    ${changed ? `<div class="small muted">${icon('edit')} Edited after signing: ${esc(sigEdits(g, d).join('; '))}. The signature stays valid.</div>` : ''}</div>`;
 }
 
 /* ================= EDITOR ================= */
@@ -1965,10 +2006,11 @@ function openEditor(id, opts = {}) {
       // carry equipment & setup from previous dive
       Object.assign(D, { gas: clone(last.gas), tank: { ...clone(last.tank), end: null }, weight: last.weight, suit: clone(last.suit), gear: clone(last.gear || []), water: last.water, entry: last.entry,
       });
-      const sameTrip = (toMs(D.start) - toMs(last.start)) < 3 * 864e5;
-      if (sameTrip) Object.assign(D, { operator: last.operator, boat: last.boat, buddies: [...(last.buddies || [])], guide: last.guide });
+      const sameTrip = (toMs(D.start) - toMs(last.start)) < 3 * 864e5, sameDay = D.start.slice(0, 10) === last.start.slice(0, 10);
+      if (sameTrip) Object.assign(D, { operator: last.operator, boat: last.boat });
+      if (sameDay) Object.assign(D, { buddies: [...(last.buddies || [])], guide: last.guide }); // guides change from day to day
       D.gear.forEach(e => { if (e.src === 'rent' && !e.size) { const r = lastRental(e.cat); if (r) { e.size = r.size; e.model = e.model || r.model; } } });
-      Dmeta.prefillFrom = { num: last.num, sameTrip };
+      Dmeta.prefillFrom = { num: last.num, sameTrip, sameDay };
     }
     if (opts.copyFrom) {
       const c = diveById(opts.copyFrom); D.siteId = c.siteId; Dmeta.site = clone(siteById(c.siteId));
@@ -1977,7 +2019,7 @@ function openEditor(id, opts = {}) {
   } else { D = clone(diveById(id)); Dmeta.site = clone(siteById(D.siteId) || null); }
   const stubs = isNew ? S.dives.filter(x => !x.siteId && x.computer).sort((a, b) => b.start.localeCompare(a.start)) : [];
   const stubHtml = stubs.length ? `<div class="notice">${icon('download')}<div class="small grow"><b>Your computer already recorded ${stubs.length > 1 ? 'these dives' : 'this dive'}.</b> Complete it instead of starting from scratch:<div class="row wrap" style="margin-top:6px">${stubs.slice(0, 4).map(x => `<button type="button" class="chip" data-act="edit" data-id="${x.id}">${fmtDate(x.start)} · ${fmt(x.maxDepth, 1)} m · ${x.duration}′</button>`).join('')}</div><div style="margin-top:4px">If you continue here, the app merges this entry with a computer dive within 45 min.</div></div></div>` : '';
-  const sg = D.signatureIds?.length ? `<div class="notice warn">${icon('shield')}<div>This dive is signed. Changing date, site, depth or time will flag the signature as outdated.</div></div>` : '';
+  const sg = D.signatureIds?.length ? `<div class="notice warn">${icon('shield')}<div>This dive is signed by ${esc(sigsFor(D).map(g => g.name).join(', ') || 'your guide')}. You can still change it and the signature stays valid; changes to date, site, depth or time are shown on the dive page as "edited after signing".</div></div>` : '';
   const body = `<form class="form" id="dform" autocomplete="off">${stubHtml}${sg}
     <fieldset><legend>${icon('pin')}Site</legend>
       <label class="f">Dive site name<input type="text" id="siteName" placeholder="Start typing, e.g. Elphinstone" value="${esc(Dmeta.site?.name || '')}"></label>
@@ -2002,7 +2044,7 @@ function openEditor(id, opts = {}) {
       <label class="f">Surface${seg('surface', [['', '–'], ['calm', 'Calm'], ['choppy', 'Choppy'], ['rough', 'Rough']], D.surface)}</label>
       <label class="f" id="altRow" ${D.water === 'fresh' ? '' : 'hidden'}>Altitude <span class="u">m above sea level</span><input type="number" data-k="altitude" inputmode="numeric" value="${D.altitude ?? ''}"></label></fieldset>
     <fieldset><legend>${icon('layers')}Gas, tank & weighting</legend>
-      ${Dmeta.prefillFrom ? `<div class="prefill">${icon('copy')}Prefilled from dive #${Dmeta.prefillFrom.num}${Dmeta.prefillFrom.sameTrip ? ' (same trip: operator, boat, buddies too)' : ''}. Change what differs.</div>` : ''}
+      ${Dmeta.prefillFrom ? `<div class="prefill">${icon('copy')}Prefilled from dive #${Dmeta.prefillFrom.num}${Dmeta.prefillFrom.sameDay ? ' (same day: operator, boat, guide, buddies too)' : Dmeta.prefillFrom.sameTrip ? ' (same trip: operator and boat too)' : ''}. Change what differs.</div>` : ''}
       ${seg('gas.mix', [['air', 'Air'], ['eanx', 'Nitrox']], D.gas.mix)}
       <div class="grid2"><label class="f" id="o2Row" ${D.gas.mix === 'eanx' ? '' : 'hidden'}>O₂ <span class="u">%</span><input type="number" step="0.1" data-k="gas.o2" inputmode="decimal" value="${D.gas.o2 ?? ''}"></label>
         <label class="f">Tank <span class="u">L</span><input type="number" step="0.5" data-k="tank.volume" inputmode="decimal" value="${D.tank.volume ?? ''}"></label></div>
@@ -2021,8 +2063,9 @@ function openEditor(id, opts = {}) {
       <div class="chips" id="lifeGroups"></div><div id="lifeSel" class="hint"></div><div class="lifegrid" id="lifeGrid"></div>
       <div class="hint">Tap once = seen. Tap again = a few, then lots, then remove.</div></fieldset>
     <fieldset><legend>${icon('star')}People, rating & notes</legend>
-      <label class="f">Buddies <span class="u">comma separated</span><input type="text" id="buddies" list="dl-buddy" value="${esc((D.buddies || []).join(', '))}"></label>
-      <label class="f">Guide / instructor<input type="text" data-k="guide" list="dl-guide" value="${esc(D.guide)}"></label>
+      <label class="f">Guide / instructor<input type="text" data-k="guide" id="guideIn" list="dl-guide" value="${esc(D.guide)}" autocapitalize="words"></label>
+      <label class="f">Buddies <span class="u">comma separated</span><input type="text" id="buddies" value="${esc((D.buddies || []).join(', '))}" autocapitalize="words"></label>
+      <div id="budSugg"></div><div id="pplChips"></div>
       <div class="stars" id="stars" role="group" aria-label="Rating"></div>
       <label class="f">Notes<textarea data-k="notes" placeholder="What made this dive memorable, hazards, tips for next time">${esc(D.notes)}</textarea></label>
       <label class="btn" style="cursor:pointer">${icon('camera')}Add photos<input type="file" accept="image/*" multiple id="photoIn" hidden></label><div class="lifegrid" id="photoList"></div></fieldset>
@@ -2060,7 +2103,11 @@ function bindEditor() {
     if (k === 'gas.mix') { $('#o2Row').hidden = b.dataset.v !== 'eanx'; if (b.dataset.v === 'air') D.gas.o2 = 21; else if (D.gas.o2 === 21) { D.gas.o2 = 32; $('[data-k="gas.o2"]').value = 32; } drawCalc(); }
     if (k.startsWith('suit') || k.startsWith('tank') || k === 'water') drawWeightHint();
   });
-  $('#buddies').addEventListener('input', e => D.buddies = e.target.value.split(',').map(s => s.trim()).filter(Boolean));
+  $('#buddies').addEventListener('input', e => { D.buddies = e.target.value.split(',').map(s => s.trim()).filter(Boolean); drawBudSugg(); drawPeople(); });
+  $('#buddies').addEventListener('blur', e => { D.buddies = capList(D.buddies); e.target.value = D.buddies.join(', '); setTimeout(() => { if (document.activeElement !== $('#buddies')) $('#budSugg') && ($('#budSugg').innerHTML = ''); }, 250); });
+  $('#guideIn').addEventListener('blur', e => { D.guide = capName(D.guide); e.target.value = D.guide; drawPeople(); });
+  $('#guideIn').addEventListener('input', () => drawPeople());
+  drawPeople();
   const sn = $('#siteName');
   sn.addEventListener('input', () => { siteTyping(sn.value); });
   $('#lifeQ').addEventListener('input', debounce(e => { Dmeta.lifeQ = e.target.value; drawLife(); }, 120));
@@ -2217,6 +2264,39 @@ function siteHistory(siteId) {
   return `<div class="small">You dived here ${ds.length}× (last ${fmtDay(ds.map(d => d.start).sort().pop())}). Max ${fmt(max, 1)} m${vis.length ? `, vis ${Math.min(...vis)}–${Math.max(...vis)} m` : ''}${wt.length ? `, water ${Math.min(...wt)}–${Math.max(...wt)} °C` : ''}.${life.length ? ` Seen: ${life.map(lifeName).join(', ')}.` : ''}</div>`;
 }
 // before a site is chosen: show where the phone was and offer your nearby sites
+/* ---- People: names from the same trip as one-tap chips ---- */
+function peoplePool() {
+  const t0 = toMs(D.start || new Date().toISOString().slice(0, 16));
+  const ts = trips(); let t = ts.find(x => x.dives.some(o => o.id === D.id));
+  if (!t) t = ts.find(x => t0 >= toMs(x.first.start) - 4 * 864e5 && t0 - toMs(x.last.start) <= 4 * 864e5);
+  const pool = (t ? t.dives : S.dives.filter(o => Math.abs(toMs(o.start) - t0) <= 14 * 864e5)).filter(o => o.id !== D.id);
+  return pool.sort((a, b) => Math.abs(toMs(a.start) - t0) - Math.abs(toMs(b.start) - t0)); // closest in time first
+}
+function drawPeople() {
+  const el = $('#pplChips'); if (!el) return;
+  const pool = peoplePool(), t0 = toMs(D.start || '');
+  const guides = capList(pool.map(o => o.guide)).slice(0, 8), buds = capList(pool.flatMap(o => o.buddies || [])).slice(0, 8);
+  const withP = pool.filter(o => o.guide || o.buddies?.length);
+  const same = withP.find(o => toMs(o.start) < t0) || withP[0];
+  const g0 = norm(D.guide), have = new Set((D.buddies || []).map(norm));
+  const sameIs = same && norm(same.guide) === g0 && capList(same.buddies).map(norm).sort().join() === [...have].sort().join();
+  if (!guides.length && !buds.length) { el.innerHTML = ''; return; }
+  el.innerHTML = `<div class="stack" style="gap:6px"><div class="small muted">People on this trip: tap to fill</div>
+    ${same && !sameIs ? `<div class="chips"><button type="button" class="chip" data-act="ppl-same" data-id="${same.id}">${icon('copy')}Same as #${same.num} (${esc([capName(same.guide), ...capList(same.buddies)].filter(Boolean).join(' · '))})</button></div>` : ''}
+    ${guides.length ? `<div class="chips" aria-label="Guide">${guides.map(n => `<button type="button" class="chip" data-act="ppl-guide" data-v="${esc(n)}" aria-pressed="${norm(n) === g0}">Guide: ${esc(n)}</button>`).join('')}</div>` : ''}
+    ${buds.length ? `<div class="chips" aria-label="Buddies">${buds.map(n => `<button type="button" class="chip" data-act="ppl-bud" data-v="${esc(n)}" aria-pressed="${have.has(norm(n))}">${esc(n)}</button>`).join('')}</div>` : ''}</div>`;
+}
+// suggestions for the name being typed after the last comma (the browser list only matched the whole box)
+function drawBudSugg() {
+  const el = $('#budSugg'); if (!el) return; const inp = $('#buddies');
+  const tok = norm(inp.value.split(',').pop()); const have = new Set((D.buddies || []).slice(0, -1).map(norm));
+  if (!tok) { el.innerHTML = ''; return; }
+  const all = capList(chrono().reverse().flatMap(o => o.buddies || [])).filter(n => !have.has(norm(n)) && norm(n) !== tok && norm(n).split(' ').some(w => w.startsWith(tok)));
+  el.innerHTML = all.length ? `<div class="chips">${all.slice(0, 6).map(n => `<button type="button" class="chip" data-act="bud-sugg" data-v="${esc(n)}">${esc(n)}</button>`).join('')}</div>` : '';
+}
+const setBuddies = list => { D.buddies = capList(list); const i = $('#buddies'); if (i) i.value = D.buddies.join(', '); drawPeople(); };
+const setGuide = v => { D.guide = v; const i = $('#guideIn'); if (i) i.value = v; drawPeople(); };
+
 function phonePanel() {
   const m = diveMark(); if (!m) return '';
   const near = Dmeta.cand = candidates(D, m); const dr = drift(m);
@@ -2232,7 +2312,7 @@ function drawSiteCard() {
   const nDives = S.dives.filter(d => d.siteId === s.id && d.id !== D.id).length + 1;
   const prev = Dmeta.prevSite && !siteById(s.id) && Dmeta.prevSite.id !== s.id ? Dmeta.prevSite : null;
   const near = S.sites.filter(o => o.id !== s.id && siteById(s.id)).map(o => ({ o, km: kmBetween(s, o) })).filter(x => x.km == null ? (s.region && x.o.region === s.region) : x.km < 30).sort((a, b) => (a.km ?? 99) - (b.km ?? 99)).slice(0, 12);
-  el.innerHTML = `${prev ? `<div class="notice warn">${icon('warn')}<div class="small grow">Did you mean to <b>rename</b> “${esc(prev.name)}”? A new site detaches this dive${isSignedDraft() ? ' and voids its signature' : ''}.
+  el.innerHTML = `${prev ? `<div class="notice warn">${icon('warn')}<div class="small grow">Did you mean to <b>rename</b> “${esc(prev.name)}”? A new site detaches this dive${isSignedDraft() ? ' (the signature stays, noted as edited)' : ''}.
       <div style="margin-top:6px"><button type="button" class="btn small" data-act="rename-instead">Rename “${esc(prev.name)}” to “${esc(s.name)}”</button></div></div></div>` : ''}
     <div class="sitecard">${icon('pin')}<div class="grow stack" style="gap:4px"><div><b>${esc(s.name)}</b> ${siteById(s.id) ? '<span class="badge">In your log</span>' : '<span class="badge accent">New site</span>'}</div>
       ${siteById(s.id) ? `<label class="f">Site name <span class="u">renames it for ${nDives} dive${nDives > 1 ? 's' : ''}; signatures stay valid</span><input type="text" id="siteRename" value="${esc(s.name)}"></label>` : ''}
@@ -2291,7 +2371,7 @@ async function saveDive() {
   if (!D.start) { toast('Add the date and time'); return; }
   const s = Dmeta.site; const i = S.sites.findIndex(x => x.id === s.id);
   if (i >= 0) S.sites[i] = s; else S.sites.push(s);
-  D.siteId = s.id;
+  D.siteId = s.id; D.guide = capName(D.guide); D.buddies = capList(D.buddies);
   if (S.dives.some(x => x.num === D.num && x.id !== D.id)) toast(`Note: dive #${D.num} already exists`);
   let merged = false;
   if (Dmeta.isNew) { // manual entry made after a computer import: absorb the matching stub
@@ -2304,7 +2384,7 @@ async function saveDive() {
   { const m = diveMark(); if (m) D.mark = markRec(m); }
   const j = S.dives.findIndex(x => x.id === D.id); if (j >= 0) S.dives[j] = D; else S.dives.push(D);
   await save('dives', 'sites', 'gear');
-  closeSheet(); toast(merged ? `Dive #${D.num} saved and merged with computer data` : Dmeta.isNew ? `Dive #${D.num} saved` : 'Changes saved'); route();
+  closeSheet(); toast(merged ? `Dive #${D.num} saved and merged with computer data` : Dmeta.isNew ? `Dive #${D.num} saved` : sigsFor(D).some(g => sigChanged(g, D)) ? 'Saved. Signed dive: the change is noted, no new signature needed' : 'Changes saved'); route();
 }
 
 /* ================= DIVE COMPUTER IMPORT (.fit) ================= */
@@ -2690,19 +2770,20 @@ function shrinkImage(file, max, q) {
 let SG = null;
 function renderSign() {
   const unsigned = chrono().filter(d => !isSigned(d));
-  const changed = chrono().filter(d => sigsFor(d).some(g => sigChanged(g, d)));
-  SG = SG || { sel: new Set(), filter: 'unsigned', signerId: '', mode: 'draw', name: '', role: 'Instructor', agency: 'PADI', number: '', image: '', stamp: '', saveSigner: true, confirm: false };
-  const list = (SG.filter === 'unsigned' ? unsigned : chrono()).slice().reverse();
-  const tripsU = trips().map(t => ({ t, ids: t.dives.filter(d => SG.filter !== 'unsigned' || !isSigned(d)).map(d => d.id) })).filter(x => x.ids.length);
+  SG = SG || { sel: new Set(), trip: '', guide: '', signerId: '', mode: 'draw', name: '', role: 'Instructor', agency: 'PADI', number: '', image: '', stamp: '', saveSigner: true, confirm: false };
+  const tripsU = trips().map(t => ({ t, ids: t.dives.filter(d => !isSigned(d)).map(d => d.id) })).filter(x => x.ids.length);
+  const inTrip = SG.trip ? new Set(tripsU.find(x => x.t.first.id === SG.trip)?.ids || []) : null;
+  const byTrip = unsigned.filter(d => !inTrip || inTrip.has(d.id));
+  const gcount = new Map(); for (const d of byTrip) { const k = norm(d.guide) || '__none'; const e = gcount.get(k) || [capName(d.guide), 0]; e[1]++; gcount.set(k, e); }
+  const list = byTrip.filter(d => !SG.guide || (norm(d.guide) || '__none') === SG.guide).reverse();
   shell('Sign dives', `${unsigned.length} unsigned · ${S.signatures.length} signature records`, `
-    ${changed.length ? `<div class="notice warn">${icon('warn')}<div class="small">${changed.length} signed dive${changed.length > 1 ? 's were' : ' was'} edited after signing (${changed.map(d => '#' + d.num).join(', ')}). Ask for a new signature.</div></div>` : ''}
     <div class="panel stack"><div class="step"><span class="n">1</span><h2 class="grow">Choose dives</h2><span class="num small muted" id="selCount">${SG.sel.size} selected</span></div>
-      <div class="row wrap"><button class="chip" data-act="sg-filter" data-v="unsigned" aria-pressed="${SG.filter === 'unsigned'}">Unsigned</button><button class="chip" data-act="sg-filter" data-v="all" aria-pressed="${SG.filter === 'all'}">All dives</button>
-        <span class="grow"></span><button class="btn small" data-act="sg-none">Clear</button></div>
-      ${tripsU.length ? `<div class="chips">${tripsU.slice(0, 6).map(x => `<button class="chip" data-act="sg-trip" data-ids="${x.ids.join(',')}">Select ${esc(x.t.region)} ${x.t.first.start.slice(0, 4)} (${x.ids.length})</button>`).join('')}</div>` : ''}
+      <div class="grid2"><label class="f">Trip<select id="sgTrip"><option value="">All trips (${unsigned.length})</option>${tripsU.map(x => `<option value="${x.t.first.id}" ${SG.trip === x.t.first.id ? 'selected' : ''}>${esc(x.t.region)} ${fmtRange(x.t.first.start, x.t.last.start)} (${x.ids.length})</option>`).join('')}</select></label>
+        <label class="f">Guide / instructor<select id="sgGuide"><option value="">All guides (${byTrip.length})</option>${[...gcount].filter(([k]) => k !== '__none').sort((a, b) => b[1][1] - a[1][1]).map(([k, [nm, n]]) => `<option value="${esc(k)}" ${SG.guide === k ? 'selected' : ''}>${esc(nm)} (${n})</option>`).join('')}${gcount.has('__none') ? `<option value="__none" ${SG.guide === '__none' ? 'selected' : ''}>No guide entered (${gcount.get('__none')[1]})</option>` : ''}</select></label></div>
+      <div class="row wrap">${list.length ? `<button class="btn small" data-act="sg-all">Select all shown (${list.length})</button>` : ''}<span class="grow"></span><button class="btn small" data-act="sg-none">Clear</button></div>
       <div class="picklist">${list.length ? list.map(d => { const s = siteById(d.siteId); return `<label class="pick"><input type="checkbox" data-sgpick="${d.id}" ${SG.sel.has(d.id) ? 'checked' : ''}>
-        <div style="min-width:0"><div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">#${d.num} ${esc(s?.name)}</div><div class="small muted">${fmtDate(d.start)}</div></div>
-        <div class="num small">${fmt(d.maxDepth, 1)} m · ${fmt(d.duration)}′</div></label>`; }).join('') : '<div class="empty">All dives are signed.</div>'}</div></div>
+        <div style="min-width:0"><div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">#${d.num} ${esc(s?.name)}</div><div class="small muted">${fmtDate(d.start)}${d.guide ? ' · ' + esc(d.guide) : ''}</div></div>
+        <div class="num small">${fmt(d.maxDepth, 1)} m · ${fmt(d.duration)}′</div></label>`; }).join('') : (unsigned.length ? '<div class="empty">No unsigned dive matches these filters.</div>' : '<div class="empty">All dives are signed.</div>')}</div></div>
     <div class="panel stack"><div class="step"><span class="n">2</span><h2>Who signs</h2></div>
       <div class="chips">${S.signers.map(g => `<button class="chip" data-act="sg-signer" data-id="${g.id}" aria-pressed="${SG.signerId === g.id}">${esc(g.name)}</button>`).join('')}<button class="chip" data-act="sg-signer" data-id="" aria-pressed="${!SG.signerId}">${icon('plus')}New person</button></div>
       <div class="grid2"><label class="f">Name<input type="text" id="sg_name" value="${esc(SG.name)}"></label><label class="f">Role<select id="sg_role">${['Instructor', 'Divemaster', 'Dive guide', 'Buddy'].map(r => `<option ${r === SG.role ? 'selected' : ''}>${r}</option>`).join('')}</select></label></div>
@@ -2719,6 +2800,15 @@ function renderSign() {
 }
 let pad = null;
 function bindSign() {
+  // filters: changing one deselects the dives it hides, so what is selected is always what you see
+  const refilter = () => { renderSign(); const shown = new Set($$('[data-sgpick]').map(x => x.dataset.sgpick)); let drop = false; for (const id of [...SG.sel]) if (!shown.has(id)) { SG.sel.delete(id); drop = true; } if (drop) renderSign(); };
+  $('#sgTrip')?.addEventListener('change', e => { SG.trip = e.target.value; refilter(); });
+  $('#sgGuide')?.addEventListener('change', e => { SG.guide = e.target.value;
+    if (SG.guide && SG.guide !== '__none') { // a saved signer with the same name signs; otherwise the name is pre-filled
+      const g = S.signers.find(x => norm(x.name) === SG.guide || SG.guide.includes(norm(x.name)) || norm(x.name).includes(SG.guide));
+      if (g) Object.assign(SG, { signerId: g.id, name: g.name, role: g.role, agency: g.agency, number: g.number, stamp: g.stamp || '', image: '', mode: 'image' });
+      else Object.assign(SG, { signerId: '', name: capName($('#sgGuide').selectedOptions[0].textContent.replace(/ \(\d+\)$/, '')), number: '', stamp: '', image: '', mode: 'draw' }); }
+    refilter(); });
   $$('[data-sgpick]').forEach(cb => cb.addEventListener('change', () => { cb.checked ? SG.sel.add(cb.dataset.sgpick) : SG.sel.delete(cb.dataset.sgpick); $('#selCount').textContent = SG.sel.size + ' selected'; drawSgSummary(); }));
   const bindIn = (id, k) => $(id).addEventListener('input', e => { SG[k] = e.target.value; drawSgSummary(); });
   bindIn('#sg_name', 'name'); bindIn('#sg_number', 'number'); $('#sg_role').addEventListener('change', e => { SG.role = e.target.value; drawSgSummary(); }); $('#sg_agency').addEventListener('change', e => SG.agency = e.target.value);
@@ -2773,10 +2863,10 @@ async function doSign() {
   if (!image) { toast('Add a signature image first'); return; }
   let signerId = SG.signerId || null;
   if (SG.saveSigner) {
-    if (!signerId) { signerId = uid('sg'); S.signers.push({ id: signerId, name: SG.name.trim(), role: SG.role, agency: SG.agency, number: SG.number, signature: image, stamp: SG.stamp }); }
-    else { const g = signerById(signerId); Object.assign(g, { name: SG.name.trim(), role: SG.role, agency: SG.agency, number: SG.number, signature: image, stamp: SG.stamp || g.stamp }); }
+    if (!signerId) { signerId = uid('sg'); S.signers.push({ id: signerId, name: capName(SG.name), role: SG.role, agency: SG.agency, number: SG.number, signature: image, stamp: SG.stamp }); }
+    else { const g = signerById(signerId); Object.assign(g, { name: capName(SG.name), role: SG.role, agency: SG.agency, number: SG.number, signature: image, stamp: SG.stamp || g.stamp }); }
   }
-  const rec = { id: uid('sig'), diveIds: ids, signerId, name: SG.name.trim(), role: SG.role, agency: SG.agency, number: SG.number, method: SG.mode === 'draw' ? 'drawn' : 'image', image, stamp: SG.stamp || '', signedAt: new Date().toISOString().slice(0, 10), fp: {}, note: '' };
+  const rec = { id: uid('sig'), diveIds: ids, signerId, name: capName(SG.name), role: SG.role, agency: SG.agency, number: SG.number, method: SG.mode === 'draw' ? 'drawn' : 'image', image, stamp: SG.stamp || '', signedAt: new Date().toISOString().slice(0, 10), fp: {}, note: '' };
   ids.forEach(id => { const d = diveById(id); rec.fp[id] = fingerprint(d); d.signatureIds = [...(d.signatureIds || []), rec.id]; });
   S.signatures.push(rec); await save('signatures', 'signers', 'dives');
   toast(`${ids.length} dive${ids.length > 1 ? 's' : ''} signed by ${rec.name}`); SG = null; renderSign();
@@ -2873,6 +2963,11 @@ document.addEventListener('click', async e => {
     case 'pick-near': pickSite({ siteId: id }); break;
     case 'new-site': newSite(); break;
     case 'pick-cand': pickSite(Dmeta.cand?.[+b.dataset.i]); break;
+    case 'ppl-guide': setGuide(norm(D.guide) === norm(b.dataset.v) ? '' : b.dataset.v); break;
+    case 'ppl-bud': { const v = b.dataset.v, l = D.buddies || []; setBuddies(l.some(x => norm(x) === norm(v)) ? l.filter(x => norm(x) !== norm(v)) : [...l, v]); break; }
+    case 'ppl-same': { const o = diveById(id); if (o) { setGuide(capName(o.guide)); setBuddies(o.buddies || []); } break; }
+    case 'bud-sugg': { const l = (D.buddies || []).slice(0, -1); setBuddies([...l, b.dataset.v]); $('#budSugg').innerHTML = ''; const i = $('#buddies'); i.value += ', '; i.focus(); break; }
+    case 'dive-nav': openDive(id); break;
     case 'confirm': openConfirm(''); break;
     case 'cf-pick': cfAssign(id, CF.cand[id]?.[+b.dataset.i]); break;
     case 'cf-pickq': cfAssign(id, CF.sugg[id]?.[+b.dataset.i]); break;
@@ -2929,6 +3024,7 @@ document.addEventListener('click', async e => {
       setTimeout(() => { if (!SG) renderSign(); SG.sel.add(id); SG.filter = 'all'; renderSign(); }, 60); break;
     case 'sg-filter': SG.filter = b.dataset.v; renderSign(); break;
     case 'sg-none': SG.sel.clear(); renderSign(); break;
+    case 'sg-all': $$('[data-sgpick]').forEach(x => SG.sel.add(x.dataset.sgpick)); renderSign(); break;
     case 'sg-trip': b.dataset.ids.split(',').forEach(x => SG.sel.add(x)); renderSign(); break;
     case 'sg-signer': { SG.signerId = id; const g = signerById(id); if (g) Object.assign(SG, { name: g.name, role: g.role, agency: g.agency, number: g.number, stamp: g.stamp || '', image: '', mode: 'image' }); else Object.assign(SG, { name: '', number: '', stamp: '', image: '', mode: 'draw' }); renderSign(); break; }
     case 'sg-do': doSign(); break;
