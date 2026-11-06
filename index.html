@@ -1912,7 +1912,7 @@ function sheet(title, body, foot = '', opts = {}) {
 function closeSheet() { const s = $('#sheet'); if (s) { s.remove(); document.body.style.overflow = ''; } if (sheetMap) { sheetMap.remove(); sheetMap = null; } }
 
 /* ================= DIVE DETAIL ================= */
-function openDive(id) {
+function openDive(id, dir, interactive) {
   const d = diveById(id); if (!d) return; const s = siteById(d.siteId) || {};
   const prev = chrono().filter(x => x.start < d.start).pop();
   const si = prev && prev.duration ? (toMs(d.start) - toMs(prev.start)) / 6e4 - prev.duration : null;
@@ -1968,13 +1968,66 @@ function openDive(id) {
   // neighbours: the log as shown (search and year filter included), newest first; else all dives
   const order = LOGORDER.includes(d.id) ? LOGORDER : chrono().reverse().map(x => x.id), oi = order.indexOf(d.id);
   const newer = order[oi - 1], older = order[oi + 1];
-  const nav = (to, lbl, ch) => `<button class="iconbtn" data-act="dive-nav" data-id="${to || ''}" aria-label="${lbl}" ${to ? '' : 'disabled style="opacity:.3"'}><span style="font-size:22px;line-height:1">${ch}</span></button>`;
+  const nav = (to, lbl, ch) => `<button class="iconbtn" data-act="dive-nav" data-dir="${ch === '›' ? 'older' : 'newer'}" data-id="${to || ''}" aria-label="${lbl}" ${to ? '' : 'disabled style="opacity:.3"'}><span style="font-size:22px;line-height:1">${ch}</span></button>`;
+  const oldSheet = dir && $('#sheet .sheet'); const oldRect = oldSheet?.getBoundingClientRect(), oldScroll = oldSheet ? $('.sheet-b', oldSheet).scrollTop : 0;
+  const anchor = oldSheet ? pageAnchor($('.sheet-b', oldSheet)) : null;
+  if (oldSheet) oldSheet.remove(); // the live page is kept and becomes the turning (or covered) page; it may still be under the finger
   sheet(`Dive #${d.num}`, body, `<button class="btn" data-act="dup" data-id="${d.id}">${icon('copy')}Next dive here</button><button class="btn primary" data-act="edit" data-id="${d.id}">${icon('edit')}Edit</button>`, { actions: `${nav(newer, 'Newer dive', '‹')}${nav(older, 'Older dive', '›')}` });
-  // swipe left = older (next in the log), right = newer; not from the screen edges (Android back gesture)
-  const sb = $('#sheet .sheet-b'); let sx = null, sy = 0;
-  sb.addEventListener('touchstart', e => { const t = e.touches[0]; sx = e.touches.length > 1 || t.clientX < 24 || t.clientX > innerWidth - 24 || e.target.closest('input, textarea, select, canvas, .chips') ? null : t.clientX; sy = t.clientY; }, { passive: true });
-  sb.addEventListener('touchend', e => { if (sx == null) return; const t = e.changedTouches[0], dx = t.clientX - sx, dy = t.clientY - sy; sx = null;
-    if (Math.abs(dx) >= 60 && Math.abs(dx) > 1.5 * Math.abs(dy)) { const to = dx < 0 ? older : newer; if (to) openDive(to); } }, { passive: true });
+  if (anchor) applyAnchor($('#sheet .sheet-b'), anchor);
+  // the page follows the finger: drag left = older (next in the log), right = newer. Not from the screen edges (Android back gesture).
+  const sb = $('#sheet .sheet-b'); sb.style.touchAction = 'pan-y'; let st = null;
+  sb.addEventListener('touchstart', e => { const t = e.touches[0]; st = e.touches.length > 1 || t.clientX < 24 || t.clientX > innerWidth - 24 || e.target.closest('input, textarea, select, canvas, .chips') ? null : { x: t.clientX, y: t.clientY, px: t.clientX, pt: e.timeStamp, v: 0 }; }, { passive: true });
+  sb.addEventListener('touchmove', e => { if (!st) return; const t = e.touches[0], dx = t.clientX - st.x, dy = t.clientY - st.y;
+    if (!st.ctl) {
+      if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+      const dir = dx < 0 ? 'older' : 'newer', to = dir === 'older' ? older : newer;
+      if (Math.abs(dx) <= 1.5 * Math.abs(dy) || !to) { st = null; return; } // vertical: normal scrolling
+      st.dir = dir; st.ctl = openDive(to, dir, true); if (!st.ctl) { st = null; return; } }
+    const dt = e.timeStamp - st.pt; if (dt > 0) st.v = (t.clientX - st.px) / dt; st.px = t.clientX; st.pt = e.timeStamp;
+    st.ctl.set((st.dir === 'older' ? -dx : dx) / (innerWidth * .75)); }, { passive: true });
+  const release = e => { if (!st?.ctl) { st = null; return; } const fling = (st.dir === 'older' ? -st.v : st.v);
+    st.ctl.end(e.type === 'touchend' && (st.ctl.p > .35 || fling > .4) && fling > -.2); st = null; };
+  sb.addEventListener('touchend', release, { passive: true }); sb.addEventListener('touchcancel', release, { passive: true });
+  if (oldSheet) { const ctl = pageTurn(oldSheet, oldRect, oldScroll, dir, id); if (!interactive) ctl.end(true); return ctl; }
+}
+// reading position kept between dives: the section at the top of the screen (panel title) and the offset inside it;
+// the next dive opens at the same section, or at the same height if it has no such section
+const secKey = el => el.querySelector('h3')?.textContent.trim() || el.className || el.tagName;
+function pageAnchor(sb) {
+  if (!sb || sb.scrollTop < 20) return null; const top = sb.getBoundingClientRect().top, kids = [...sb.children];
+  const el = kids.find(k => k.getBoundingClientRect().bottom > top + 8); if (!el) return { px: sb.scrollTop };
+  const key = secKey(el); return { key, nth: kids.filter(k => secKey(k) === key).indexOf(el), off: top - el.getBoundingClientRect().top, px: sb.scrollTop };
+}
+function applyAnchor(sb, a) {
+  if (!sb || !a) return; const top = sb.getBoundingClientRect().top;
+  const el = a.key && [...sb.children].filter(k => secKey(k) === a.key)[a.nth];
+  sb.scrollTop = el ? el.getBoundingClientRect().top - top + sb.scrollTop + Math.min(a.off, el.offsetHeight - 40) : a.px;
+}
+// page turn between dives, spine on the left like a book: older = the current page turns over to the left;
+// newer = the previous page turns back in from the left, over the current one. set(p) follows the finger (0 to 1),
+// end(true) completes the turn, end(false) puts the page back.
+function pageTurn(oldSheet, rect, scroll, dir) {
+  const bg = $('#sheet'), ns = $('.sheet', bg);
+  bg.style.animation = 'none'; ns.style.animation = 'none';
+  Object.assign(oldSheet.style, { position: 'fixed', left: rect.left + 'px', top: rect.top + 'px', width: rect.width + 'px', height: rect.height + 'px', margin: '0', animation: 'none', zIndex: dir === 'older' ? '3' : '1' });
+  bg.appendChild(oldSheet); $('.sheet-b', oldSheet).scrollTop = scroll;
+  const turning = dir === 'older' ? oldSheet : ns, under = dir === 'older' ? ns : oldSheet;
+  if (dir === 'newer') Object.assign(ns.style, { position: 'relative', zIndex: '2' });
+  Object.assign(turning.style, { transformOrigin: 'left center', backfaceVisibility: 'hidden', willChange: 'transform' });
+  const shade = el => { const s = document.createElement('div'); Object.assign(s.style, { position: 'absolute', inset: '0', pointerEvents: 'none', borderRadius: 'inherit', zIndex: '5', background: 'linear-gradient(to left, rgba(0,0,0,.45), rgba(0,0,0,.08) 60%, rgba(0,0,0,0))' }); el.appendChild(s); return s; };
+  const sT = shade(turning), sU = shade(under);
+  const ctl = { p: 0, done: false };
+  ctl.set = v => { ctl.p = Math.max(0, Math.min(1, v)); const a = dir === 'older' ? -100 * ctl.p : -100 * (1 - ctl.p), k = -a / 100;
+    turning.style.transform = `perspective(1800px) rotateY(${a}deg)`; sT.style.opacity = k; sU.style.opacity = .35 * (1 - k); };
+  ctl.set(0);
+  ctl.end = commit => { if (ctl.done) return; ctl.done = true;
+    const from = ctl.p, to = commit ? 1 : 0, dur = matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 480 * Math.abs(to - from), t0 = performance.now();
+    const finish = () => { sT.remove(); sU.remove();
+      if (commit) { oldSheet.remove(); for (const k of ['transform', 'transformOrigin', 'backfaceVisibility', 'willChange', 'position', 'zIndex']) ns.style[k] = ''; }
+      else { ns.remove(); const sc = $('.sheet-b', oldSheet).scrollTop; oldSheet.style.cssText = ''; $('.sheet-b', oldSheet).scrollTop = sc; } };
+    const step = now => { const q = dur ? Math.min(1, (now - t0) / dur) : 1, e = 1 - Math.pow(1 - q, 3); ctl.set(from + (to - from) * e); if (q < 1) requestAnimationFrame(step); else finish(); };
+    requestAnimationFrame(step); };
+  return ctl;
 }
 function sigBlock(g, d) {
   const sg = g.signerId ? signerById(g.signerId) : null;
@@ -2967,7 +3020,7 @@ document.addEventListener('click', async e => {
     case 'ppl-bud': { const v = b.dataset.v, l = D.buddies || []; setBuddies(l.some(x => norm(x) === norm(v)) ? l.filter(x => norm(x) !== norm(v)) : [...l, v]); break; }
     case 'ppl-same': { const o = diveById(id); if (o) { setGuide(capName(o.guide)); setBuddies(o.buddies || []); } break; }
     case 'bud-sugg': { const l = (D.buddies || []).slice(0, -1); setBuddies([...l, b.dataset.v]); $('#budSugg').innerHTML = ''; const i = $('#buddies'); i.value += ', '; i.focus(); break; }
-    case 'dive-nav': openDive(id); break;
+    case 'dive-nav': openDive(id, b.dataset.dir); break;
     case 'confirm': openConfirm(''); break;
     case 'cf-pick': cfAssign(id, CF.cand[id]?.[+b.dataset.i]); break;
     case 'cf-pickq': cfAssign(id, CF.sugg[id]?.[+b.dataset.i]); break;
